@@ -23,6 +23,7 @@ dependencies {
 
     implementation("com.zaxxer:HikariCP:5.1.0")
     implementation("com.mysql:mysql-connector-j:8.4.0")
+    implementation("com.google.code.gson:gson:2.11.0")
 }
 
 tasks {

@@ -1,5 +1,7 @@
 F:\JavaProject\StellarStatsSync\src\main\java\org\stellarvan\stellarstatssync\DatabaseManager.java
 F:\JavaProject\StellarStatsSync\src\main\java\org\stellarvan\stellarstatssync\PlayerQuitListener.java
+F:\JavaProject\StellarStatsSync\src\main\java\org\stellarvan\stellarstatssync\RealtimeSyncListener.java
 F:\JavaProject\StellarStatsSync\src\main\java\org\stellarvan\stellarstatssync\StatsyncCommand.java
 F:\JavaProject\StellarStatsSync\src\main\java\org\stellarvan\stellarstatssync\StellarStatsSync.java
 F:\JavaProject\StellarStatsSync\src\main\java\org\stellarvan\stellarstatssync\SyncTask.java
+F:\JavaProject\StellarStatsSync\src\main\java\org\stellarvan\stellarstatssync\WebSocketSyncManager.java

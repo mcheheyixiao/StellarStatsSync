@@ -10,6 +10,7 @@ public class StellarStatsSync extends JavaPlugin {
 
     private DatabaseManager databaseManager;
     private SyncTask syncTask;
+    private WebSocketSyncManager webSocketSyncManager;
 
     public static boolean isDebug() {
         return DEBUG;
@@ -37,6 +38,15 @@ public class StellarStatsSync extends JavaPlugin {
         this.syncTask.runTaskTimer(this, 20L, interval);
 
         getServer().getPluginManager().registerEvents(new PlayerQuitListener(this, syncTask, databaseManager), this);
+        this.webSocketSyncManager = new WebSocketSyncManager(this);
+
+        if (webSocketSyncManager.isEnabled()) {
+            webSocketSyncManager.start();
+            getServer().getPluginManager().registerEvents(new RealtimeSyncListener(this, webSocketSyncManager), this);
+            getLogger().info("WebSocket realtime sync enabled.");
+        } else {
+            getLogger().info("WebSocket realtime sync disabled by config.");
+        }
 
         if (getCommand("statsync") != null) {
             getCommand("statsync").setExecutor(new StatsyncCommand(this, syncTask));
@@ -50,6 +60,9 @@ public class StellarStatsSync extends JavaPlugin {
     @Override
     public void onDisable() {
         this.isShuttingDown = true;
+        if (webSocketSyncManager != null) {
+            webSocketSyncManager.shutdown();
+        }
         if (syncTask != null) {
             syncTask.performSyncSyncOnDisable();
         }
@@ -93,4 +106,3 @@ public class StellarStatsSync extends JavaPlugin {
         }
     }
 }
-

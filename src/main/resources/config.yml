@@ -8,5 +8,23 @@ mysql:
   password: your_password
   maximumPoolSize: 10
 
-# 自动同步数据的间隔时间（单位：Tick。20 ticks = 1 秒。12000 = 10分钟）
+# Automatic MySQL sync interval in ticks (20 ticks = 1 second, 12000 = 10 minutes).
 sync_interval_ticks: 12000
+
+websocket:
+  enabled: false
+  # Optional full address. If set, this value has priority.
+  ws_url: "ws://127.0.0.1:3001/plugin"
+  # Optional split mode. Used when ws_url is empty.
+  server_url: "ws://127.0.0.1:3001"
+  path: "/plugin"
+  auth_token: "CHANGE_ME"
+  reconnect_interval_seconds: 5
+  heartbeat_interval_seconds: 20
+  report_interval_seconds: 2
+  sync_chat: true
+  sync_player_join_quit: true
+  sync_plugin_status: true
+  debug: false
+  queue_limit: 1024
+  connect_timeout_seconds: 10
