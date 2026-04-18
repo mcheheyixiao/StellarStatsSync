@@ -18,6 +18,9 @@ websocket:
   # Optional split mode. Used when ws_url is empty.
   server_url: "ws://127.0.0.1:3001"
   path: "/plugin"
+  server_id: "default"
+  server_name: "default"
+  # Deprecated for StellarRealtime protocol, kept for backward compatibility.
   auth_token: "CHANGE_ME"
   reconnect_interval_seconds: 5
   heartbeat_interval_seconds: 20
