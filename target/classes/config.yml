@@ -1,0 +1,12 @@
+debug: false
+
+mysql:
+  host: localhost
+  port: 3306
+  database: your_database
+  user: your_user
+  password: your_password
+  maximumPoolSize: 10
+
+# 自动同步数据的间隔时间（单位：Tick。20 ticks = 1 秒。12000 = 10分钟）
+sync_interval_ticks: 12000

@@ -1,0 +1,8 @@
+org\stellarvan\stellarstatssync\DatabaseManager$DbSyncResult.class
+org\stellarvan\stellarstatssync\SyncTask.class
+org\stellarvan\stellarstatssync\DatabaseManager.class
+org\stellarvan\stellarstatssync\PlayerQuitListener.class
+org\stellarvan\stellarstatssync\StatsyncCommand.class
+org\stellarvan\stellarstatssync\SyncTask$PlayerStatsSnapshot.class
+org\stellarvan\stellarstatssync\SyncTask$SyncResult.class
+org\stellarvan\stellarstatssync\StellarStatsSync.class

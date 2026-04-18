@@ -1,0 +1,18 @@
+name: StellarStatsSync
+main: org.stellarvan.stellarstatssync.StellarStatsSync
+version: ${version}
+api-version: "1.21"
+authors: [ StellarVan ]
+description: "Asynchronously syncs player statistics to a remote MySQL database using HikariCP."
+load: POSTWORLD
+
+commands:
+  statsync:
+    description: "Manual sync of player statistics to MySQL"
+    usage: "/statsync sync"
+    permission: stellarstats.admin
+
+permissions:
+  stellarstats.admin:
+    description: "Allows using /statsync sync"
+    default: op
