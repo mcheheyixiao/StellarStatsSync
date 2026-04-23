@@ -1,0 +1,863 @@
+package org.stellarvan.stellarstatssync;
+
+import com.google.gson.Gson;
+import org.bukkit.Bukkit;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.entity.Player;
+import org.bukkit.scheduler.BukkitTask;
+import org.stellarvan.stellarstatssync.websocket.dto.MessageEnvelope;
+
+import java.lang.management.ManagementFactory;
+import java.lang.reflect.Method;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.WebSocket;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Level;
+
+public class WebSocketSyncManager {
+
+    private static final long TICKS_PER_SECOND = 20L;
+    private static final String TYPE_STATS_UPDATE = "stats_update";
+    private static final String TYPE_PLAYERS_UPDATE = "players_update";
+    private static final String TYPE_CHAT_MESSAGE = "chat_message";
+    private static final String TYPE_PLUGINS_UPDATE = "plugins_update";
+    private static final String TYPE_SERVER_STATUS = "server_status";
+    private static final String TYPE_HEARTBEAT = "heartbeat";
+    private static final String TYPE_AUTH = "auth";
+    private static final String TYPE_ERROR = "error";
+
+    private final StellarStatsSync plugin;
+    private final Gson gson;
+    private final HttpClient httpClient;
+
+    private final boolean enabled;
+    private final URI endpoint;
+    private final String serverId;
+    private final String serverName;
+    private final long reconnectIntervalTicks;
+    private final long heartbeatIntervalTicks;
+    private final long reportIntervalTicks;
+    private final boolean syncChat;
+    private final boolean syncPlayerJoinQuit;
+    private final boolean wsDebug;
+    private final boolean suppressNormalReconnect;
+    private final int reconnectWarnThreshold;
+    private final int reconnectErrorThreshold;
+    private final boolean debugVerbose;
+    private final int queueLimit;
+    private final int connectTimeoutSeconds;
+
+    private final Object queueLock = new Object();
+    private final ArrayDeque<MessageEnvelope> pendingMessages = new ArrayDeque<>();
+    private final AtomicBoolean started = new AtomicBoolean(false);
+    private final AtomicBoolean connecting = new AtomicBoolean(false);
+    private final AtomicBoolean reconnectScheduled = new AtomicBoolean(false);
+    private final AtomicBoolean flushRunning = new AtomicBoolean(false);
+
+    private volatile WebSocket webSocket;
+    private volatile boolean authDelivered;
+    private volatile int reconnectFailures = 0;
+    private volatile long lastConnectedAt = 0L;
+    private volatile BukkitTask heartbeatTask;
+    private volatile BukkitTask reportTask;
+
+    public WebSocketSyncManager(StellarStatsSync plugin) {
+        this.plugin = plugin;
+        this.gson = new Gson();
+
+        ConfigurationSection ws = plugin.getConfig().getConfigurationSection("websocket");
+        boolean enabledFlag = ws != null && ws.getBoolean("enabled", false);
+        String configuredServerId = ws != null ? ws.getString("server_id", "default") : "default";
+        //noinspection ConstantConditions
+        this.serverId = configuredServerId == null || configuredServerId.isBlank() ? "default" : configuredServerId.trim();
+        String configuredServerName = ws != null ? ws.getString("server_name", "default") : "default";
+        //noinspection ConstantConditions
+        this.serverName = configuredServerName == null || configuredServerName.isBlank() ? "default" : configuredServerName.trim();
+
+        String wsUrl = ws != null ? ws.getString("ws_url", "").trim() : "";
+        if (wsUrl.isEmpty()) {
+            String serverUrl = ws != null ? ws.getString("server_url", "ws://127.0.0.1:3001").trim() : "ws://127.0.0.1:3001";
+            String path = ws != null ? ws.getString("path", "/plugin").trim() : "/plugin";
+            wsUrl = buildWsUrl(serverUrl, path);
+        }
+
+        URI parsedEndpoint = URI.create("ws://127.0.0.1:3001/plugin");
+        if (enabledFlag) {
+            try {
+                parsedEndpoint = URI.create(wsUrl);
+                String scheme = parsedEndpoint.getScheme();
+                if (!"ws".equalsIgnoreCase(scheme) && !"wss".equalsIgnoreCase(scheme)) {
+                    throw new IllegalArgumentException("Unsupported WebSocket scheme: " + scheme);
+                }
+            } catch (Exception ex) {
+                enabledFlag = false;
+                plugin.getLogger().severe("[WebSocket] Invalid endpoint, websocket module disabled: " + ex.getMessage());
+            }
+        }
+        this.enabled = enabledFlag;
+        this.endpoint = parsedEndpoint;
+
+        long reconnectSeconds = ws != null ? ws.getLong("reconnect_interval_seconds", 5L) : 5L;
+        long heartbeatSeconds = ws != null ? ws.getLong("heartbeat_interval_seconds", 20L) : 20L;
+        long reportSeconds = ws != null ? ws.getLong("report_interval_seconds", 2L) : 2L;
+
+        this.reconnectIntervalTicks = Math.max(1L, reconnectSeconds) * TICKS_PER_SECOND;
+        this.heartbeatIntervalTicks = Math.max(1L, heartbeatSeconds) * TICKS_PER_SECOND;
+        this.reportIntervalTicks = Math.max(1L, reportSeconds) * TICKS_PER_SECOND;
+
+        this.syncChat = ws == null || ws.getBoolean("sync_chat", true);
+        this.syncPlayerJoinQuit = ws == null || ws.getBoolean("sync_player_join_quit", true);
+        this.wsDebug = ws != null && ws.getBoolean("debug", false);
+        ConfigurationSection wsLog = ws != null ? ws.getConfigurationSection("log") : null;
+        this.suppressNormalReconnect = wsLog == null || wsLog.getBoolean("suppress_normal_reconnect", true);
+        int configuredWarnThreshold = wsLog != null ? wsLog.getInt("reconnect_warn_threshold", 5) : 5;
+        int configuredErrorThreshold = wsLog != null ? wsLog.getInt("reconnect_error_threshold", 15) : 15;
+        this.reconnectWarnThreshold = Math.max(1, configuredWarnThreshold);
+        this.reconnectErrorThreshold = Math.max(this.reconnectWarnThreshold + 1, configuredErrorThreshold);
+        this.debugVerbose = wsLog != null && wsLog.getBoolean("debug_verbose", false);
+        this.queueLimit = Math.max(32, ws != null ? ws.getInt("queue_limit", 1024) : 1024);
+        this.connectTimeoutSeconds = Math.max(1, ws != null ? ws.getInt("connect_timeout_seconds", 10) : 10);
+
+        this.httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(connectTimeoutSeconds))
+                .build();
+    }
+
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    public boolean isSyncChatEnabled() {
+        return enabled && syncChat;
+    }
+
+    @SuppressWarnings("unused")
+    public boolean isSyncPlayerJoinQuitEnabled() {
+        return enabled && syncPlayerJoinQuit;
+    }
+
+    public void start() {
+        if (!enabled || !started.compareAndSet(false, true)) {
+            return;
+        }
+
+        this.heartbeatTask = Bukkit.getScheduler().runTaskTimerAsynchronously(
+                plugin,
+                this::sendHeartbeat,
+                heartbeatIntervalTicks,
+                heartbeatIntervalTicks
+        );
+
+        this.reportTask = Bukkit.getScheduler().runTaskTimer(
+                plugin,
+                this::sendStatsSnapshot,
+                reportIntervalTicks,
+                reportIntervalTicks
+        );
+
+        connectAsync("initial_start");
+    }
+
+    public void shutdown() {
+        if (!enabled || !started.compareAndSet(true, false)) {
+            return;
+        }
+
+        cancelTask(heartbeatTask);
+        cancelTask(reportTask);
+        heartbeatTask = null;
+        reportTask = null;
+
+        reconnectScheduled.set(false);
+        connecting.set(false);
+        flushRunning.set(false);
+
+        WebSocket ws = this.webSocket;
+        this.webSocket = null;
+        this.authDelivered = false;
+
+        if (ws != null) {
+            try {
+                ws.sendClose(WebSocket.NORMAL_CLOSURE, "plugin_disable");
+            } catch (Exception ex) {
+                ws.abort();
+            }
+        }
+    }
+
+    public void sendChatMessage(@SuppressWarnings("unused") String playerUuid, String playerName, String message) {
+        // playerUuid reserved for future protocol fields.
+        if (!enabled || !syncChat || playerUuid == null || playerName == null || message == null) {
+            return;
+        }
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("channel", "global");
+        payload.put("playerName", playerName);
+        payload.put("message", message);
+        payload.put("level", "info");
+        enqueueMessage(createSuccessEnvelope(TYPE_CHAT_MESSAGE, payload));
+    }
+
+    public void sendPlayerJoin(@SuppressWarnings("unused") String playerUuid, String playerName) {
+        // playerUuid reserved for future protocol fields.
+        if (!enabled || !syncPlayerJoinQuit || playerName == null) {
+            return;
+        }
+
+        Collection<? extends Player> onlinePlayers = Bukkit.getOnlinePlayers();
+        List<Map<String, Object>> players = new ArrayList<>(onlinePlayers.size());
+        for (Player player : onlinePlayers) {
+            players.add(toPlayerDto(player));
+        }
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("players", players);
+        enqueueMessage(createSuccessEnvelope(TYPE_PLAYERS_UPDATE, payload));
+    }
+
+    public void sendPlayerQuit(@SuppressWarnings("unused") String playerUuid, String playerName) {
+        // playerUuid reserved for future protocol fields.
+        if (!enabled || !syncPlayerJoinQuit || playerName == null) {
+            return;
+        }
+
+        Collection<? extends Player> onlinePlayers = Bukkit.getOnlinePlayers();
+        List<Map<String, Object>> players = new ArrayList<>(onlinePlayers.size());
+        for (Player player : onlinePlayers) {
+            if (!playerName.equals(player.getName())) {
+                players.add(toPlayerDto(player));
+            }
+        }
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("players", players);
+        enqueueMessage(createSuccessEnvelope(TYPE_PLAYERS_UPDATE, payload));
+    }
+
+    @SuppressWarnings("unused")
+    // Reserved API for future outbound plugin state sync.
+    public void sendPluginsUpdate(Map<String, Object> payload) {
+        if (!enabled || payload == null) {
+            return;
+        }
+        enqueueMessage(createSuccessEnvelope(TYPE_PLUGINS_UPDATE, payload));
+    }
+
+    @SuppressWarnings("unused")
+    // Reserved API for future outbound server status sync.
+    public void sendServerStatus(Map<String, Object> payload) {
+        if (!enabled || payload == null) {
+            return;
+        }
+        enqueueMessage(createSuccessEnvelope(TYPE_SERVER_STATUS, payload));
+    }
+
+    private void connectAsync(String reason) {
+        if (!enabled || !started.get() || plugin.isShuttingDown()) {
+            return;
+        }
+        if (webSocket != null || !connecting.compareAndSet(false, true)) {
+            return;
+        }
+
+        logDebug("Connecting to " + endpoint + " (" + reason + ")");
+
+        httpClient.newWebSocketBuilder()
+                .connectTimeout(Duration.ofSeconds(connectTimeoutSeconds))
+                .buildAsync(endpoint, new WsListener())
+                .whenComplete((ws, throwable) -> {
+                    connecting.set(false);
+                    if (!started.get() || plugin.isShuttingDown()) {
+                        if (ws != null) {
+                            ws.abort();
+                        }
+                        return;
+                    }
+
+                    if (throwable != null) {
+                        recordReconnectFailure("connect_failure", -1, throwable.getMessage());
+                        logVerboseThrowable(throwable);
+                        scheduleReconnect("connect_failure");
+                        return;
+                    }
+
+                    this.webSocket = ws;
+                    this.authDelivered = false;
+                    int previousFailures = markConnectionRecovered();
+                    if (previousFailures >= reconnectWarnThreshold) {
+                        logInfo("WebSocket reconnected after " + previousFailures + " failures.");
+                    }
+                    logDebug("Connected to WebSocket server.");
+                    sendAuth();
+                });
+    }
+
+    @SuppressWarnings("deprecation")
+    private void sendAuth() {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("serverId", serverId);
+        payload.put("serverName", serverName);
+        payload.put("platform", "bukkit");
+        payload.put("version", plugin.getDescription().getVersion());
+
+        // Fixed values ("auth", true) keep auth-send semantics stable for protocol compatibility.
+        sendDirect(createSuccessEnvelope(TYPE_AUTH, payload), "auth", true);
+    }
+
+    private void sendHeartbeat() {
+        //noinspection ConstantConditions
+        //noinspection NegatedIfCondition
+        if (!enabled || !started.get() || !isConnectionReady()) {
+            return;
+        }
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("queuedMessages", queuedSize());
+        enqueueMessage(createSuccessEnvelope(TYPE_HEARTBEAT, payload));
+    }
+
+    @SuppressWarnings("deprecation")
+    private void sendStatsSnapshot() {
+        if (!enabled || !started.get()) {
+            return;
+        }
+
+        Map<String, Object> metrics = new LinkedHashMap<>();
+
+        Collection<? extends Player> onlinePlayers = Bukkit.getOnlinePlayers();
+        metrics.put("onlinePlayers", onlinePlayers.size());
+        metrics.put("maxPlayers", Bukkit.getMaxPlayers());
+
+        List<Double> tpsValues = resolveTpsValues();
+        if (!tpsValues.isEmpty()) {
+            metrics.put("tps", tpsValues.getFirst());
+        }
+
+        Double mspt = resolveAverageMspt();
+        if (mspt != null) {
+            metrics.put("mspt", mspt);
+        }
+        Double cpuUsage = resolveCpuUsagePercent();
+        if (cpuUsage != null) {
+            metrics.put("cpuUsage", cpuUsage);
+        }
+
+        Map<String, Object> jvmMemory = collectJvmMemory();
+        Object memoryUsedMb = jvmMemory.get("used_mb");
+        if (memoryUsedMb instanceof Number value) {
+            metrics.put("memoryUsedMb", value.longValue());
+        }
+        Object memoryMaxMb = jvmMemory.get("max_mb");
+        if (memoryMaxMb instanceof Number value) {
+            metrics.put("memoryMaxMb", value.longValue());
+        }
+        metrics.put("uptimeSeconds", ManagementFactory.getRuntimeMXBean().getUptime() / 1000L);
+
+        Map<String, Object> serverInfo = new LinkedHashMap<>();
+        serverInfo.put("motd", Bukkit.getMotd());
+        if (!Bukkit.getWorlds().isEmpty()) {
+            serverInfo.put("world", Bukkit.getWorlds().getFirst().getName());
+        }
+        String host = Bukkit.getIp();
+        //noinspection ConstantConditions
+        String addressHost = (host == null || host.isBlank()) ? "0.0.0.0" : host;
+        serverInfo.put("address", addressHost + ":" + Bukkit.getPort());
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("metrics", metrics);
+        payload.put("serverInfo", serverInfo);
+
+        enqueueMessage(createSuccessEnvelope(TYPE_STATS_UPDATE, payload));
+    }
+
+    private Map<String, Object> collectJvmMemory() {
+        Runtime runtime = Runtime.getRuntime();
+        long max = runtime.maxMemory();
+        long total = runtime.totalMemory();
+        long free = runtime.freeMemory();
+        long used = total - free;
+
+        Map<String, Object> memory = new LinkedHashMap<>();
+        memory.put("used_mb", bytesToMb(used));
+        memory.put("free_mb", bytesToMb(free));
+        memory.put("total_mb", bytesToMb(total));
+        memory.put("max_mb", bytesToMb(max));
+        return memory;
+    }
+
+    private void enqueueMessage(MessageEnvelope message) {
+        if (!enabled || !started.get() || message == null) {
+            return;
+        }
+
+        int dropped = 0;
+        synchronized (queueLock) {
+            pendingMessages.addLast(message);
+            while (pendingMessages.size() > queueLimit) {
+                pendingMessages.pollFirst();
+                dropped++;
+            }
+        }
+
+        if (dropped > 0) {
+            logWarn("Message queue exceeded limit (" + queueLimit + "), dropped oldest messages: " + dropped);
+        }
+
+        flushQueue();
+    }
+
+    private void enqueueMessageFirst(MessageEnvelope message) {
+        if (message == null) {
+            return;
+        }
+
+        int dropped = 0;
+        synchronized (queueLock) {
+            pendingMessages.addFirst(message);
+            while (pendingMessages.size() > queueLimit) {
+                pendingMessages.pollLast();
+                dropped++;
+            }
+        }
+
+        if (dropped > 0) {
+            logWarn("Message queue exceeded limit (" + queueLimit + "), dropped newest messages: " + dropped);
+        }
+    }
+
+    private void flushQueue() {
+        //noinspection ConstantConditions
+        //noinspection NegatedIfCondition
+        if (!enabled || !started.get() || !isConnectionReady()) {
+            return;
+        }
+        if (!flushRunning.compareAndSet(false, true)) {
+            return;
+        }
+
+        sendNextQueuedMessage();
+    }
+
+    private void sendNextQueuedMessage() {
+        //noinspection ConstantConditions
+        //noinspection NegatedIfCondition
+        if (!enabled || !started.get() || !isConnectionReady()) {
+            flushRunning.set(false);
+            return;
+        }
+
+        MessageEnvelope message;
+        synchronized (queueLock) {
+            message = pendingMessages.pollFirst();
+        }
+
+        if (message == null) {
+            flushRunning.set(false);
+            return;
+        }
+
+        WebSocket ws = this.webSocket;
+        if (ws == null) {
+            enqueueMessageFirst(message);
+            flushRunning.set(false);
+            return;
+        }
+
+        send(ws, message).whenComplete((ignored, throwable) -> {
+            if (throwable != null) {
+                enqueueMessageFirst(message);
+                flushRunning.set(false);
+                logSendFailureEnvelope(message.requestId);
+                recordReconnectFailure("send_failure", -1, throwable.getMessage());
+                logVerboseThrowable(throwable);
+                forceCloseCurrentSocket();
+                scheduleReconnect("send_failure");
+                return;
+            }
+
+            sendNextQueuedMessage();
+        });
+    }
+
+    @SuppressWarnings("SameParameterValue")
+    private void sendDirect(MessageEnvelope message, String purpose, boolean markAuthDeliveredOnSuccess) {
+        // parameters intentionally fixed for protocol stage
+        //noinspection ConstantConditions
+        if (!enabled || !started.get()) {
+            return;
+        }
+
+        WebSocket ws = this.webSocket;
+        if (ws == null) {
+            if (markAuthDeliveredOnSuccess) {
+                scheduleReconnect("missing_socket_for_auth");
+            } else {
+                enqueueMessage(message);
+            }
+            return;
+        }
+
+        send(ws, message).whenComplete((ignored, throwable) -> {
+            if (throwable != null) {
+                logSendFailureEnvelope(message.requestId);
+                recordReconnectFailure("direct_send_failure_" + purpose, -1, throwable.getMessage());
+                logVerboseThrowable(throwable);
+                if (!markAuthDeliveredOnSuccess) {
+                    enqueueMessageFirst(message);
+                }
+                forceCloseCurrentSocket();
+                scheduleReconnect("direct_send_failure_" + purpose);
+                return;
+            }
+
+            if (markAuthDeliveredOnSuccess) {
+                authDelivered = true;
+                logDebug("Auth delivered.");
+                Bukkit.getScheduler().runTask(plugin, this::sendStatsSnapshot);
+            }
+
+            flushQueue();
+        });
+    }
+
+    @SuppressWarnings("unused")
+    // Reserved internal direct-send path for controlled shutdown/future fast-path.
+    private void trySendDirect(MessageEnvelope message) {
+        //noinspection NegatedIfCondition
+        if (!isConnectionReady()) {
+            return;
+        }
+        WebSocket ws = this.webSocket;
+        if (ws != null) {
+            try {
+                send(ws, message);
+            } catch (Exception ex) {
+                logWarn("Failed to send shutdown message: " + ex.getMessage());
+            }
+        }
+    }
+
+    private CompletionStage<WebSocket> send(WebSocket ws, MessageEnvelope message) {
+        return ws.sendText(serializeEnvelope(message), true);
+    }
+
+    private String serializeEnvelope(MessageEnvelope message) {
+        message.ensureCompatibility();
+        String json = gson.toJson(message);
+        logOutboundEnvelope(message, json);
+        return json;
+    }
+
+    private void logOutboundEnvelope(MessageEnvelope message, String json) {
+        if (!isVerboseLoggingEnabled()) {
+            return;
+        }
+        int size = json.getBytes(StandardCharsets.UTF_8).length;
+        logDebug("Outbound envelope: {type=" + message.type + ", requestId=" + message.requestId + ", size=" + size + " bytes}");
+    }
+
+    private void logSendFailureEnvelope(String requestId) {
+        if (!isVerboseLoggingEnabled()) {
+            return;
+        }
+        // Fixed values kept intentionally for protocol-consistent error reporting.
+        MessageEnvelope errorEnvelope = createErrorEnvelope(4000, "WebSocket send failed", requestId);
+        logDebug("Standard error envelope: {type=" + errorEnvelope.type
+                + ", code=" + errorEnvelope.code
+                + ", requestId=" + errorEnvelope.requestId
+                + ", message=" + errorEnvelope.message + "}");
+    }
+
+    private void scheduleReconnect(String cause) {
+        //noinspection ConstantConditions
+        if (!enabled || !started.get() || plugin.isShuttingDown()) {
+            return;
+        }
+        if (!reconnectScheduled.compareAndSet(false, true)) {
+            return;
+        }
+
+        logDebug("Scheduling reconnect in " + (reconnectIntervalTicks / TICKS_PER_SECOND) + "s (" + cause + ")");
+
+        Bukkit.getScheduler().runTaskLaterAsynchronously(plugin, () -> {
+            reconnectScheduled.set(false);
+            //noinspection ConstantConditions
+            if (!enabled || !started.get() || plugin.isShuttingDown()) {
+                return;
+            }
+            connectAsync("reconnect_" + cause);
+        }, reconnectIntervalTicks);
+    }
+
+    private boolean isConnectionReady() {
+        return this.webSocket != null && this.authDelivered;
+    }
+
+    private int queuedSize() {
+        synchronized (queueLock) {
+            return pendingMessages.size();
+        }
+    }
+
+    private void forceCloseCurrentSocket() {
+        WebSocket ws = this.webSocket;
+        this.webSocket = null;
+        this.authDelivered = false;
+        if (ws != null) {
+            try {
+                ws.abort();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private List<Double> resolveTpsValues() {
+        Object tpsObj = tryInvokeNoArgMethod(Bukkit.getServer(), "getTPS");
+        if (tpsObj instanceof double[] values && values.length > 0) {
+            return toRoundedList(values);
+        }
+
+        Object spigotObj = tryInvokeNoArgMethod(Bukkit.getServer(), "spigot");
+        if (spigotObj != null) {
+            Object spigotTps = tryInvokeNoArgMethod(spigotObj, "getTPS");
+            if (spigotTps instanceof double[] values && values.length > 0) {
+                return toRoundedList(values);
+            }
+        }
+
+        return List.of();
+    }
+
+    private Double resolveAverageMspt() {
+        Object msptObj = tryInvokeNoArgMethod(Bukkit.getServer(), "getAverageTickTime");
+        if (msptObj instanceof Number number) {
+            return round(number.doubleValue());
+        }
+        return null;
+    }
+
+    private Double resolveCpuUsagePercent() {
+        try {
+            Object osBean = ManagementFactory.getOperatingSystemMXBean();
+            Object value = tryInvokeNoArgMethod(osBean, "getSystemCpuLoad");
+            if (value == null) {
+                value = tryInvokeNoArgMethod(osBean, "getCpuLoad");
+            }
+            if (value instanceof Number number) {
+                double raw = number.doubleValue();
+                if (raw >= 0D) {
+                    return round(Math.min(100D, raw * 100D));
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    private Object tryInvokeNoArgMethod(Object target, String methodName) {
+        if (target == null) {
+            return null;
+        }
+        try {
+            Method method = target.getClass().getMethod(methodName);
+            return method.invoke(target);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private List<Double> toRoundedList(double[] values) {
+        int length = Math.min(3, values.length);
+        List<Double> result = new ArrayList<>(length);
+        for (int i = 0; i < length; i++) {
+            result.add(round(values[i]));
+        }
+        return result;
+    }
+
+    private MessageEnvelope createSuccessEnvelope(String type, Object data) {
+        // fixed value for protocol consistency: null requestId triggers auto-generation.
+        return createSuccessEnvelope(type, data, null);
+    }
+
+    @SuppressWarnings("SameParameterValue")
+    private MessageEnvelope createSuccessEnvelope(String type, Object data, String requestId) {
+        return MessageEnvelope.success(type, data, requestId);
+    }
+
+    @SuppressWarnings("SameParameterValue")
+    private MessageEnvelope createErrorEnvelope(int code, String errorMessage, String requestId) {
+        return MessageEnvelope.error(TYPE_ERROR, code, errorMessage, requestId);
+    }
+
+    private Map<String, Object> toPlayerDto(Player player) {
+        Map<String, Object> dto = new LinkedHashMap<>();
+        dto.put("name", player.getName());
+        try {
+            dto.put("uuid", player.getUniqueId().toString());
+        } catch (Exception ignored) {
+        }
+        try {
+            //noinspection ConstantConditions
+            dto.put("world", player.getWorld() != null ? player.getWorld().getName() : null);
+        } catch (Exception ignored) {
+        }
+        try {
+            Method getPing = player.getClass().getMethod("getPing");
+            Object pingValue = getPing.invoke(player);
+            if (pingValue instanceof Number number) {
+                dto.put("ping", number.intValue());
+            }
+        } catch (Exception ignored) {
+        }
+        return dto;
+    }
+
+    private static String buildWsUrl(String serverUrl, String path) {
+        String normalizedServerUrl = serverUrl.endsWith("/") ? serverUrl.substring(0, serverUrl.length() - 1) : serverUrl;
+        String normalizedPath = path.startsWith("/") ? path : "/" + path;
+        return normalizedServerUrl + normalizedPath;
+    }
+
+    private static double round(double value) {
+        return Math.round(value * 100.0D) / 100.0D;
+    }
+
+    private static long bytesToMb(long value) {
+        return value / (1024L * 1024L);
+    }
+
+    private void cancelTask(BukkitTask task) {
+        if (task != null) {
+            task.cancel();
+        }
+    }
+
+    private synchronized int markConnectionRecovered() {
+        int previousFailures = reconnectFailures;
+        reconnectFailures = 0;
+        lastConnectedAt = System.currentTimeMillis();
+        return previousFailures;
+    }
+
+    private synchronized void recordReconnectFailure(String source, int statusCode, String detail) {
+        reconnectFailures++;
+
+        if (isVerboseLoggingEnabled()) {
+            StringBuilder debugMessage = new StringBuilder("Reconnect event: ");
+            debugMessage.append(source).append(", failures=").append(reconnectFailures);
+            if (statusCode >= 0) {
+                debugMessage.append(", code=").append(statusCode);
+            }
+            if (detail != null && !detail.isBlank()) {
+                debugMessage.append(", detail=").append(detail);
+            }
+            if (lastConnectedAt > 0L) {
+                debugMessage.append(", last_connected_ago_ms=")
+                        .append(Math.max(0L, System.currentTimeMillis() - lastConnectedAt));
+            }
+            logDebug(debugMessage.toString());
+        }
+
+        if (reconnectFailures >= reconnectErrorThreshold) {
+            logError("WebSocket reconnect failed too many times: " + reconnectFailures + " (source=" + source + ")");
+            return;
+        }
+
+        if (reconnectFailures >= reconnectWarnThreshold) {
+            logWarn("WebSocket reconnect attempt " + reconnectFailures + " (source=" + source + ")");
+            return;
+        }
+
+        if (!suppressNormalReconnect) {
+            logInfo("WebSocket reconnect attempt " + reconnectFailures + " (source=" + source + ")");
+        }
+    }
+
+    private void logVerboseThrowable(Throwable throwable) {
+        if (throwable != null && isVerboseLoggingEnabled()) {
+            plugin.getLogger().log(Level.SEVERE, "[WebSocket] Exception occurred", throwable);
+        }
+    }
+
+    private boolean isVerboseLoggingEnabled() {
+        return debugVerbose || wsDebug || StellarStatsSync.isDebug();
+    }
+
+    private void logInfo(String message) {
+        plugin.getLogger().info("[WebSocket] " + message);
+    }
+
+    private void logWarn(String message) {
+        plugin.getLogger().warning("[WebSocket] " + message);
+    }
+
+    private void logError(String message) {
+        plugin.getLogger().severe("[WebSocket] " + message);
+    }
+
+    private void logDebug(String message) {
+        if (isVerboseLoggingEnabled()) {
+            plugin.getLogger().info("[WebSocket][Debug] " + message);
+        }
+    }
+
+    private final class WsListener implements WebSocket.Listener {
+
+        private final StringBuilder frameBuffer = new StringBuilder();
+
+        @Override
+        public void onOpen(WebSocket webSocket) {
+            webSocket.request(1);
+            logDebug("Socket opened.");
+        }
+
+        @Override
+        public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
+            frameBuffer.append(data);
+            if (last) {
+                String payload = frameBuffer.toString();
+                frameBuffer.setLength(0);
+                if (isVerboseLoggingEnabled()) {
+                    logDebug("Inbound message: " + payload);
+                }
+            }
+            webSocket.request(1);
+            return CompletableFuture.completedFuture(null);
+        }
+
+        @Override
+        public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
+            recordReconnectFailure("on_close", statusCode, reason);
+            WebSocketSyncManager.this.webSocket = null;
+            WebSocketSyncManager.this.authDelivered = false;
+            if (started.get() && !plugin.isShuttingDown()) {
+                scheduleReconnect("on_close");
+            }
+            return CompletableFuture.completedFuture(null);
+        }
+
+        @Override
+        public void onError(WebSocket webSocket, Throwable error) {
+            String detail = error == null ? "unknown" : error.getMessage();
+            recordReconnectFailure("on_error", -1, detail);
+            logVerboseThrowable(error);
+            forceCloseCurrentSocket();
+            if (started.get() && !plugin.isShuttingDown()) {
+                scheduleReconnect("on_error");
+            }
+        }
+    }
+}

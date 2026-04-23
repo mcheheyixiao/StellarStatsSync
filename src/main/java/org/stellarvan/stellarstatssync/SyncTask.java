@@ -12,6 +12,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.logging.Level;
 
 public class SyncTask extends BukkitRunnable {
 
@@ -140,7 +141,7 @@ public class SyncTask extends BukkitRunnable {
         } catch (SQLException e) {
             plugin.getLogger().severe("Failed to sync player stats on disable: " + e.getMessage());
             if (StellarStatsSync.isDebug()) {
-                e.printStackTrace();
+                plugin.getLogger().log(Level.SEVERE, "[Debug] Disable sync failed", e);
             }
         }
     }

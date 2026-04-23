@@ -12,6 +12,7 @@ import java.sql.SQLException;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.logging.Level;
 
 public class DatabaseManager {
 
@@ -55,6 +56,7 @@ public class DatabaseManager {
         }
     }
 
+    @SuppressWarnings("unused")
     public void syncPlayerStatsAsync(SyncTask.PlayerStatsSnapshot snapshot) {
         if (snapshot == null) {
             return;
@@ -62,6 +64,7 @@ public class DatabaseManager {
         syncPlayerStatsAsync(List.of(snapshot));
     }
 
+    @SuppressWarnings("unused")
     public void syncPlayerStatsAsync(Collection<SyncTask.PlayerStatsSnapshot> snapshots) {
         if (snapshots == null || snapshots.isEmpty()) {
             return;
@@ -73,7 +76,7 @@ public class DatabaseManager {
             } catch (SQLException e) {
                 plugin.getLogger().severe("Failed to sync player stats: " + e.getMessage());
                 if (StellarStatsSync.isDebug()) {
-                    e.printStackTrace();
+                    plugin.getLogger().log(Level.SEVERE, "[Debug] Async sync failed", e);
                 }
             }
         });
@@ -92,7 +95,7 @@ public class DatabaseManager {
             } catch (SQLException e) {
                 plugin.getLogger().severe("Failed to sync player stats: " + e.getMessage());
                 if (StellarStatsSync.isDebug()) {
-                    e.printStackTrace();
+                    plugin.getLogger().log(Level.SEVERE, "[Debug] Async sync with result failed", e);
                 }
                 future.completeExceptionally(e);
             }
@@ -101,6 +104,7 @@ public class DatabaseManager {
         return future;
     }
 
+    @SuppressWarnings("unused")
     public DbSyncResult syncPlayerStatsInternal(SyncTask.PlayerStatsSnapshot snapshot) throws SQLException {
         if (snapshot == null) {
             return new DbSyncResult(0, 0, 0);
@@ -108,7 +112,9 @@ public class DatabaseManager {
         return syncPlayerStatsInternal(List.of(snapshot));
     }
 
+    @SuppressWarnings({"unused", "SqlNoDataSourceInspection"})
     public DbSyncResult syncPlayerStatsInternal(Collection<SyncTask.PlayerStatsSnapshot> snapshots) throws SQLException {
+        //noinspection SqlNoDataSourceInspection
         String sql =
                 "INSERT INTO player_stats " +
                         "  (mc_uuid, username, play_time_ticks, fly_distance_cm, deaths, fish_caught, player_kills, blocks_mined, blocks_placed) " +
@@ -165,7 +171,9 @@ public class DatabaseManager {
         }
     }
 
+    @SuppressWarnings("SqlNoDataSourceInspection")
     private boolean isUserRegistered(Connection conn, String uuid) throws SQLException {
+        //noinspection SqlNoDataSourceInspection
         String sql = "SELECT 1 FROM users WHERE mc_uuid = ? LIMIT 1";
         try (PreparedStatement stmt = conn.prepareStatement(sql)) {
             stmt.setString(1, uuid);
@@ -178,4 +186,3 @@ public class DatabaseManager {
     public record DbSyncResult(int batchSize, int matchedUsers, long totalAffectedRows) {
     }
 }
-

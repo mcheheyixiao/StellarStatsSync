@@ -4,6 +4,9 @@ import org.bukkit.Bukkit;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
+import org.jetbrains.annotations.NotNull;
+
+import java.util.logging.Level;
 
 public class StatsyncCommand implements CommandExecutor {
 
@@ -16,7 +19,12 @@ public class StatsyncCommand implements CommandExecutor {
     }
 
     @Override
-    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+    public boolean onCommand(
+            @NotNull CommandSender sender,
+            @NotNull Command command,
+            @NotNull String label,
+            @NotNull String[] args
+    ) {
         if (!sender.hasPermission("stellarstats.admin")) {
             sender.sendMessage("你没有权限使用该命令。");
             return true;
@@ -40,7 +48,7 @@ public class StatsyncCommand implements CommandExecutor {
                 sender.sendMessage("同步失败: " + throwable.getMessage());
                 if (StellarStatsSync.isDebug()) {
                     plugin.getLogger().severe("[Debug] 手动同步失败: " + throwable.getMessage());
-                    throwable.printStackTrace();
+                    plugin.getLogger().log(Level.SEVERE, "[Debug] 手动同步失败异常", throwable);
                 }
                 return;
             }

@@ -1,7 +1,10 @@
 package org.stellarvan.stellarstatssync;
 
 import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.command.PluginCommand;
 import org.bukkit.plugin.java.JavaPlugin;
+
+import java.util.logging.Level;
 
 public class StellarStatsSync extends JavaPlugin {
 
@@ -48,10 +51,11 @@ public class StellarStatsSync extends JavaPlugin {
             getLogger().info("WebSocket realtime sync disabled by config.");
         }
 
-        if (getCommand("statsync") != null) {
-            getCommand("statsync").setExecutor(new StatsyncCommand(this, syncTask));
+        PluginCommand statsyncCommand = getCommand("statsync");
+        if (statsyncCommand != null) {
+            statsyncCommand.setExecutor(new StatsyncCommand(this, syncTask));
         } else {
-            getLogger().severe("Command 'statsync' is not defined in plugin.yml");
+            getLogger().warning("Command 'statsync' not found in plugin.yml");
         }
 
         getLogger().info("StellarStatsSync enabled.");
@@ -100,7 +104,7 @@ public class StellarStatsSync extends JavaPlugin {
         } catch (Exception e) {
             getLogger().severe("Error initializing DatabaseManager: " + e.getMessage());
             if (isDebug()) {
-                e.printStackTrace();
+                getLogger().log(Level.SEVERE, "[Debug] DatabaseManager initialization failure", e);
             }
             return false;
         }

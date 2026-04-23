@@ -29,5 +29,10 @@ websocket:
   sync_player_join_quit: true
   sync_plugin_status: true
   debug: false
+  log:
+    suppress_normal_reconnect: true
+    reconnect_warn_threshold: 5
+    reconnect_error_threshold: 15
+    debug_verbose: false
   queue_limit: 1024
   connect_timeout_seconds: 10

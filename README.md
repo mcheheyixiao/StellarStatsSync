@@ -73,18 +73,18 @@
 
 ### 日志行为
 
-- 典型日志：
-- `[WebSocket] Connecting to ...`
-- `[WebSocket] Connected to WebSocket server.`
-- `[WebSocket] Socket closed. code=..., reason=...`
-- `[WebSocket] Socket error: ...`
-- `[WebSocket] Scheduling reconnect in Xs (...)`
-- `[WebSocket] Send failed, scheduling reconnect: ...`
-- Debug 日志（需 `websocket.debug=true` 或全局 `debug=true`）：
+- 默认日志（非 debug）：
+- 正常抖动场景（如偶发 `1006`）默认静默，不输出 `Socket closed / Scheduling reconnect`。
+- 当连续失败达到 `reconnect_warn_threshold` 时输出 `WARN`。
+- 当连续失败达到 `reconnect_error_threshold` 时输出 `ERROR`。
+- Debug 日志（`websocket.debug=true`、全局 `debug=true` 或 `websocket.log.debug_verbose=true`）：
+- `[WebSocket][Debug] Connecting to ...`
+- `[WebSocket][Debug] Connected to WebSocket server.`
+- `[WebSocket][Debug] Scheduling reconnect in Xs (...)`
+- `[WebSocket][Debug] Outbound envelope: {type=..., requestId=..., size=... bytes}`
 - `[WebSocket][Debug] Socket opened.`
 - `[WebSocket][Debug] Auth delivered.`
 - `[WebSocket][Debug] Inbound message: ...`
-- `[WebSocket][Debug] Outbound stats_update sample: ...`
 
 ---
 
@@ -117,22 +117,66 @@
 
 分析发送/接收的数据：
 
-### 示例（统一消息信封）
+## WebSocket 协议（统一版）
 
 ```json
 {
   "type": "stats_update",
-  "timestamp": "2026-04-23T12:34:56Z",
-  "epoch_millis": 1776947696000,
+  "success": true,
+  "code": 0,
+  "message": "ok",
+  "requestId": "uuid",
+  "timestamp": 1710000000000,
+  "data": {},
   "payload": {}
 }
 ```
+
+### 字段说明
+
+| 字段 | 含义 |
+| --- | --- |
+| type | 消息类型 |
+| success | 是否成功 |
+| code | 错误码 |
+| message | 描述 |
+| requestId | 请求追踪ID |
+| timestamp | 毫秒时间戳 |
+| data | 新结构 |
+| payload | 兼容旧结构 |
+
+### 兼容策略
+
+- 新系统使用 `data`。
+- 旧系统使用 `payload`。
+- 两者始终一致（`data == payload`）。
+
+### 类型列表
+
+- `stats_update`
+- `players_update`
+- `chat_message`
+- `plugins_update`
+- `server_status`
+- `heartbeat`
+- `auth`
 
 ### 示例（鉴权）
 
 ```json
 {
   "type": "auth",
+  "success": true,
+  "code": 0,
+  "message": "ok",
+  "requestId": "uuid",
+  "timestamp": 1710000000000,
+  "data": {
+    "serverId": "default",
+    "serverName": "default",
+    "platform": "bukkit",
+    "version": "插件版本"
+  },
   "payload": {
     "serverId": "default",
     "serverName": "default",
@@ -147,6 +191,21 @@
 ```json
 {
   "type": "players_update",
+  "success": true,
+  "code": 0,
+  "message": "ok",
+  "requestId": "uuid",
+  "timestamp": 1710000000000,
+  "data": {
+    "players": [
+      {
+        "name": "PlayerA",
+        "uuid": "xxxx-xxxx",
+        "world": "world",
+        "ping": 42
+      }
+    ]
+  },
   "payload": {
     "players": [
       {
@@ -165,6 +224,17 @@
 ```json
 {
   "type": "chat_message",
+  "success": true,
+  "code": 0,
+  "message": "ok",
+  "requestId": "uuid",
+  "timestamp": 1710000000000,
+  "data": {
+    "channel": "global",
+    "playerName": "PlayerA",
+    "message": "hello",
+    "level": "info"
+  },
   "payload": {
     "channel": "global",
     "playerName": "PlayerA",
@@ -179,6 +249,14 @@
 ```json
 {
   "type": "heartbeat",
+  "success": true,
+  "code": 0,
+  "message": "ok",
+  "requestId": "uuid",
+  "timestamp": 1710000000000,
+  "data": {
+    "queuedMessages": 3
+  },
   "payload": {
     "queuedMessages": 3
   }
@@ -232,9 +310,33 @@
 - `sync_chat`
 - `sync_player_join_quit`
 - `debug`
+- `log.suppress_normal_reconnect`
+- `log.reconnect_warn_threshold`
+- `log.reconnect_error_threshold`
+- `log.debug_verbose`
 - `queue_limit`
 - `connect_timeout_seconds`
 - 兼容字段：`auth_token`、`sync_plugin_status` 目前未在核心发送逻辑中使用。
+
+## WebSocket 日志控制
+
+新增配置：
+
+```yaml
+websocket:
+  log:
+    suppress_normal_reconnect: true
+    reconnect_warn_threshold: 5
+    reconnect_error_threshold: 15
+    debug_verbose: false
+```
+
+说明：
+
+- 正常网络抖动（如 `1006`）默认静默。
+- 连续失败达到阈值后才输出 `WARN`，超过错误阈值输出 `ERROR`。
+- `debug` 或 `debug_verbose` 开启时会输出完整重连细节，避免排查盲区。
+- 默认减少 `Connecting/Scheduling reconnect/Connected` 这类日志刷屏。
 
 ---
 
@@ -257,7 +359,7 @@
 - ❌ WebSocket 入站协议处理（当前仅日志打印）
 - ❌ 指数退避与抖动重连
 - ❌ ping/pong 级别心跳与超时检测
-- ❌ 断线原因分级与指标化（仅日志文本）
+- ⚠️ 断线原因指标化上报（已实现日志分级与失败阈值，仍未做 metrics 上报）
 - ❌ WebSocket 消息 ACK/重放保障机制
 - ❌ 数据压缩 / 批处理上报策略（WebSocket 层）
 - ❌ 配置项 `sync_plugin_status` 的实际业务逻辑
@@ -269,7 +371,7 @@
 - 断链问题（`code=1006`）风险：
 - 代码会记录 close code 并重连，但无 ping/pong 与超时判定，遇到网络抖动/代理回收长连接时，异常关闭可频发。
 - 网络异常处理不足：
-- 当前主要依赖日志 + 固定间隔重连，缺少原因分层、失败计数、退避、熔断与监控指标。
+- 当前已支持原因分层与失败计数阈值日志，但仍缺少退避、熔断与监控指标。
 - 阻塞风险：
 - `SyncTask` 在主线程遍历玩家与全部方块类型统计，玩家多时可能拉高 tick 开销。
 - `onDisable` 执行同步数据库写入，停服阶段可能被数据库延迟拖慢。
