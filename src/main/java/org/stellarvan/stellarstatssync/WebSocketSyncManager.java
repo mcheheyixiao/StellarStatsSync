@@ -44,6 +44,9 @@ public class WebSocketSyncManager {
     private static final String TYPE_SNAPSHOT_REQUEST = "snapshot_request";
     private static final String TYPE_SYNC_STATE = "sync_state";
     private static final String TYPE_ERROR = "error";
+    private static final long PENDING_ACK_TTL_MILLIS = 30_000L;
+    private static final long PENDING_ACK_WARN_INTERVAL_MILLIS = 60_000L;
+    private static final int PENDING_ACK_RESTORE_LIMIT = 32;
 
     private final StellarStatsSync plugin;
     private final Gson gson;
@@ -70,6 +73,7 @@ public class WebSocketSyncManager {
     private final ArrayDeque<MessageEnvelope> pendingMessages = new ArrayDeque<>();
     private final Object pendingAckLock = new Object();
     private final LinkedHashMap<String, MessageEnvelope> pendingAckMessages = new LinkedHashMap<>();
+    private final LinkedHashMap<String, Long> pendingAckCreatedAt = new LinkedHashMap<>();
     private final Object playerStateLock = new Object();
     private final Map<String, Map<String, Object>> previousPlayers = new LinkedHashMap<>();
     private final Map<String, Integer> versionMap = new LinkedHashMap<>();
@@ -84,6 +88,7 @@ public class WebSocketSyncManager {
     private volatile long lastPongAt = 0L;
     private volatile int reconnectFailures = 0;
     private volatile long lastConnectedAt = 0L;
+    private volatile long lastPendingAckCacheWarnAt = 0L;
     private volatile BukkitTask heartbeatTask;
     private volatile BukkitTask reportTask;
 
@@ -292,6 +297,7 @@ public class WebSocketSyncManager {
         if (!enabled || !started.get() || plugin.isShuttingDown()) {
             return;
         }
+        cleanupExpiredPendingAckMessages();
         if (webSocket != null || !connecting.compareAndSet(false, true)) {
             return;
         }
@@ -646,6 +652,7 @@ public class WebSocketSyncManager {
     }
 
     private int pendingAckSize() {
+        cleanupExpiredPendingAckMessages();
         synchronized (pendingAckLock) {
             return pendingAckMessages.size();
         }
@@ -855,6 +862,7 @@ public class WebSocketSyncManager {
             return;
         }
 
+        cleanupExpiredPendingAckMessages();
         message.ensureCompatibility();
         String requestId = message.requestId;
         if (requestId == null || requestId.isBlank()) {
@@ -864,15 +872,18 @@ public class WebSocketSyncManager {
         int dropped = 0;
         synchronized (pendingAckLock) {
             pendingAckMessages.put(requestId, message);
+            pendingAckCreatedAt.putIfAbsent(requestId, System.currentTimeMillis());
             while (pendingAckMessages.size() > queueLimit) {
                 String oldestRequestId = pendingAckMessages.entrySet().iterator().next().getKey();
                 pendingAckMessages.remove(oldestRequestId);
+                pendingAckCreatedAt.remove(oldestRequestId);
                 dropped++;
             }
+            pendingAckCreatedAt.keySet().removeIf(key -> !pendingAckMessages.containsKey(key));
         }
 
         if (dropped > 0) {
-            logWarn("Pending ACK cache exceeded limit (" + queueLimit + "), dropped oldest records: " + dropped);
+            logPendingAckCacheExceeded(dropped);
         }
     }
 
@@ -880,13 +891,11 @@ public class WebSocketSyncManager {
         if (message == null || message.type == null) {
             return false;
         }
-        return switch (message.type) {
-            case TYPE_SNAPSHOT_REQUEST, TYPE_SYNC_STATE -> true;
-            default -> false;
-        };
+        return TYPE_SNAPSHOT_REQUEST.equals(message.type);
     }
 
     private void restorePendingAckMessagesToQueue() {
+        cleanupExpiredPendingAckMessages();
         List<MessageEnvelope> pendingAckSnapshot;
         synchronized (pendingAckLock) {
             if (pendingAckMessages.isEmpty()) {
@@ -905,12 +914,17 @@ public class WebSocketSyncManager {
                 }
             }
 
-            for (int i = pendingAckSnapshot.size() - 1; i >= 0; i--) {
-                MessageEnvelope pending = pendingAckSnapshot.get(i);
+            for (MessageEnvelope pending : pendingAckSnapshot) {
+                if (restored >= PENDING_ACK_RESTORE_LIMIT) {
+                    break;
+                }
                 if (pending == null) {
                     continue;
                 }
                 pending.ensureCompatibility();
+                if (pending.requestId == null || pending.requestId.isBlank()) {
+                    continue;
+                }
                 if (queuedRequestIds.contains(pending.requestId)) {
                     continue;
                 }
@@ -935,20 +949,25 @@ public class WebSocketSyncManager {
 
     private void removeFromPending(String requestId) {
         if (requestId == null || requestId.isBlank()) {
+            logDebug("ACK ignored: missing requestId.");
             return;
         }
 
-        MessageEnvelope removed;
+        boolean removed;
         synchronized (pendingAckLock) {
-            removed = pendingAckMessages.remove(requestId);
+            MessageEnvelope removedEnvelope = pendingAckMessages.remove(requestId);
+            Long removedCreatedAt = pendingAckCreatedAt.remove(requestId);
+            removed = removedEnvelope != null || removedCreatedAt != null;
         }
 
-        if (removed != null) {
+        if (removed) {
             synchronized (queueLock) {
                 pendingMessages.removeIf(message -> requestId.equals(message.requestId));
             }
-            logDebug("ACK received, cleared pending message: " + requestId);
+            logDebug("ACK received: requestId=" + requestId);
+            return;
         }
+        logDebug("ACK ignored: requestId=" + requestId + " not found in pending cache.");
     }
 
     private void clearRuntimeCaches() {
@@ -957,6 +976,8 @@ public class WebSocketSyncManager {
         }
         synchronized (pendingAckLock) {
             pendingAckMessages.clear();
+            pendingAckCreatedAt.clear();
+            lastPendingAckCacheWarnAt = 0L;
         }
         synchronized (playerStateLock) {
             previousPlayers.clear();
@@ -991,7 +1012,7 @@ public class WebSocketSyncManager {
         updateLastKnownPlayersVersion(messageType, envelope);
 
         if (TYPE_ACK.equalsIgnoreCase(messageType)) {
-            String requestId = resolveAckRequestId(envelope);
+            String requestId = asNonBlankString(envelope.get("requestId"));
             removeFromPending(requestId);
             return;
         }
@@ -1051,25 +1072,54 @@ public class WebSocketSyncManager {
         return envelope.get(key);
     }
 
-    private String resolveAckRequestId(Map<?, ?> envelope) {
-        String requestId = asNonBlankString(envelope.get("requestId"));
-        if (requestId != null) {
-            return requestId;
-        }
+    private void cleanupExpiredPendingAckMessages() {
+        long now = System.currentTimeMillis();
+        Set<String> expiredRequestIds = new HashSet<>();
 
-        Object data = envelope.get("data");
-        if (data instanceof Map<?, ?> dataMap) {
-            requestId = asNonBlankString(dataMap.get("requestId"));
-            if (requestId != null) {
-                return requestId;
+        synchronized (pendingAckLock) {
+            if (pendingAckMessages.isEmpty() && pendingAckCreatedAt.isEmpty()) {
+                return;
+            }
+
+            Set<String> requestIds = new HashSet<>(pendingAckMessages.keySet());
+            requestIds.addAll(pendingAckCreatedAt.keySet());
+            for (String requestId : requestIds) {
+                Long createdAt = pendingAckCreatedAt.get(requestId);
+                if (createdAt == null || now - createdAt > PENDING_ACK_TTL_MILLIS) {
+                    pendingAckMessages.remove(requestId);
+                    pendingAckCreatedAt.remove(requestId);
+                    expiredRequestIds.add(requestId);
+                }
             }
         }
 
-        Object payload = envelope.get("payload");
-        if (payload instanceof Map<?, ?> payloadMap) {
-            return asNonBlankString(payloadMap.get("requestId"));
+        if (!expiredRequestIds.isEmpty()) {
+            synchronized (queueLock) {
+                pendingMessages.removeIf(message ->
+                        message != null
+                                && message.requestId != null
+                                && expiredRequestIds.contains(message.requestId));
+            }
+            logDebug("Expired pending ACK records removed: " + expiredRequestIds.size());
         }
-        return null;
+    }
+
+    private void logPendingAckCacheExceeded(int dropped) {
+        long now = System.currentTimeMillis();
+        boolean shouldWarn;
+        synchronized (pendingAckLock) {
+            shouldWarn = now - lastPendingAckCacheWarnAt >= PENDING_ACK_WARN_INTERVAL_MILLIS;
+            if (shouldWarn) {
+                lastPendingAckCacheWarnAt = now;
+            }
+        }
+
+        String message = "Pending ACK cache exceeded limit (" + queueLimit + "), dropped oldest records: " + dropped;
+        if (shouldWarn) {
+            logWarn(message);
+        } else {
+            logDebug(message + " (suppressed by 60s rate limit)");
+        }
     }
 
     private void sendPong() {
