@@ -37,8 +37,10 @@ public class WebSocketSyncManager {
     private static final String TYPE_PLUGINS_UPDATE = "plugins_update";
     private static final String TYPE_SERVER_STATUS = "server_status";
     private static final String TYPE_HEARTBEAT = "heartbeat";
+    private static final String TYPE_PONG = "pong";
     private static final String TYPE_AUTH = "auth";
     private static final String TYPE_ACK = "ack";
+    private static final String TYPE_SNAPSHOT = "snapshot";
     private static final String TYPE_SNAPSHOT_REQUEST = "snapshot_request";
     private static final String TYPE_SYNC_STATE = "sync_state";
     private static final String TYPE_ERROR = "error";
@@ -78,6 +80,8 @@ public class WebSocketSyncManager {
 
     private volatile WebSocket webSocket;
     private volatile boolean authDelivered;
+    private volatile int lastKnownPlayersVersion = 0;
+    private volatile long lastPongAt = 0L;
     private volatile int reconnectFailures = 0;
     private volatile long lastConnectedAt = 0L;
     private volatile BukkitTask heartbeatTask;
@@ -259,9 +263,9 @@ public class WebSocketSyncManager {
         }
 
         Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("added", delta.added());
-        payload.put("removed", delta.removed());
-        payload.put("updated", delta.updated());
+        payload.put("add", delta.add());
+        payload.put("remove", delta.remove());
+        payload.put("update", delta.update());
         payload.put("onlineCount", currentPlayers.size());
         enqueueMessage(createSuccessEnvelope(TYPE_PLAYERS_DELTA, payload));
     }
@@ -345,6 +349,7 @@ public class WebSocketSyncManager {
 
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("queuedMessages", queuedSize());
+        payload.put("lastPongAt", lastPongAt);
         enqueueMessage(createSuccessEnvelope(TYPE_HEARTBEAT, payload));
     }
 
@@ -546,12 +551,12 @@ public class WebSocketSyncManager {
             if (markAuthDeliveredOnSuccess) {
                 authDelivered = true;
                 logDebug("Auth delivered.");
-                restorePendingAckMessagesToQueue();
-                sendSnapshotRequest();
-                sendSyncState();
                 Bukkit.getScheduler().runTask(plugin, () -> {
+                    sendSnapshotRequest();
+                    sendSyncState();
                     sendStatsSnapshot();
                     sendPlayersDelta();
+                    restorePendingAckMessagesToQueue();
                 });
             } else {
                 trackPendingAck(message);
@@ -774,9 +779,9 @@ public class WebSocketSyncManager {
     }
 
     private PlayersDelta computePlayersDelta(Map<String, Map<String, Object>> currentPlayers) {
-        List<Map<String, Object>> added = new ArrayList<>();
-        List<Map<String, Object>> removed = new ArrayList<>();
-        List<Map<String, Object>> updated = new ArrayList<>();
+        List<Map<String, Object>> add = new ArrayList<>();
+        List<Map<String, Object>> remove = new ArrayList<>();
+        List<Map<String, Object>> update = new ArrayList<>();
 
         synchronized (playerStateLock) {
             for (Map.Entry<String, Map<String, Object>> entry : currentPlayers.entrySet()) {
@@ -784,18 +789,18 @@ public class WebSocketSyncManager {
                 Map<String, Object> currentDto = copyPlayerDto(entry.getValue());
                 Map<String, Object> previousDto = previousPlayers.get(playerKey);
                 if (previousDto == null) {
-                    added.add(withVersion(currentDto, nextVersionLocked(playerKey)));
+                    add.add(withVersion(currentDto, nextVersionLocked(playerKey)));
                     continue;
                 }
                 if (!Objects.equals(previousDto, currentDto)) {
-                    updated.add(withVersion(currentDto, nextVersionLocked(playerKey)));
+                    update.add(withVersion(currentDto, nextVersionLocked(playerKey)));
                 }
             }
 
             for (Map.Entry<String, Map<String, Object>> previousEntry : previousPlayers.entrySet()) {
                 String playerKey = previousEntry.getKey();
                 if (!currentPlayers.containsKey(playerKey)) {
-                    removed.add(withVersion(previousEntry.getValue(), nextVersionLocked(playerKey)));
+                    remove.add(withVersion(previousEntry.getValue(), nextVersionLocked(playerKey)));
                 }
             }
 
@@ -805,7 +810,7 @@ public class WebSocketSyncManager {
             }
         }
 
-        return new PlayersDelta(added, removed, updated);
+        return new PlayersDelta(add, remove, update);
     }
 
     private int nextVersionLocked(String playerKey) {
@@ -840,17 +845,8 @@ public class WebSocketSyncManager {
             return;
         }
 
-        Map<String, Integer> versionsSnapshot;
-        int trackedPlayers;
-        synchronized (playerStateLock) {
-            versionsSnapshot = new LinkedHashMap<>(versionMap);
-            trackedPlayers = previousPlayers.size();
-        }
-
         Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("versionMap", versionsSnapshot);
-        payload.put("trackedPlayers", trackedPlayers);
-        payload.put("pendingAck", pendingAckSize());
+        payload.put("players_version", lastKnownPlayersVersion);
         enqueueMessage(createSuccessEnvelope(TYPE_SYNC_STATE, payload));
     }
 
@@ -885,8 +881,7 @@ public class WebSocketSyncManager {
             return false;
         }
         return switch (message.type) {
-            case TYPE_STATS_UPDATE, TYPE_PLAYERS_DELTA, TYPE_CHAT_MESSAGE, TYPE_PLUGINS_UPDATE,
-                 TYPE_SERVER_STATUS, TYPE_SNAPSHOT_REQUEST, TYPE_SYNC_STATE -> true;
+            case TYPE_SNAPSHOT_REQUEST, TYPE_SYNC_STATE -> true;
             default -> false;
         };
     }
@@ -919,13 +914,13 @@ public class WebSocketSyncManager {
                 if (queuedRequestIds.contains(pending.requestId)) {
                     continue;
                 }
-                pendingMessages.addFirst(pending);
+                pendingMessages.addLast(pending);
                 queuedRequestIds.add(pending.requestId);
                 restored++;
             }
 
             while (pendingMessages.size() > queueLimit) {
-                pendingMessages.pollLast();
+                pendingMessages.pollFirst();
                 dropped++;
             }
         }
@@ -967,6 +962,8 @@ public class WebSocketSyncManager {
             previousPlayers.clear();
             versionMap.clear();
         }
+        lastKnownPlayersVersion = 0;
+        lastPongAt = 0L;
     }
 
     private void handleInboundMessage(String rawPayload) {
@@ -991,10 +988,67 @@ public class WebSocketSyncManager {
             return;
         }
 
+        updateLastKnownPlayersVersion(messageType, envelope);
+
         if (TYPE_ACK.equalsIgnoreCase(messageType)) {
             String requestId = resolveAckRequestId(envelope);
             removeFromPending(requestId);
+            return;
         }
+
+        if (TYPE_HEARTBEAT.equalsIgnoreCase(messageType)) {
+            lastPongAt = System.currentTimeMillis();
+            sendPong();
+            return;
+        }
+
+        if (TYPE_PONG.equalsIgnoreCase(messageType)) {
+            lastPongAt = System.currentTimeMillis();
+        }
+    }
+
+    private void updateLastKnownPlayersVersion(String messageType, Map<?, ?> envelope) {
+        Integer version = null;
+        if (TYPE_SNAPSHOT.equalsIgnoreCase(messageType)) {
+            version = extractSnapshotPlayersVersion(envelope);
+        } else if (TYPE_PLAYERS_DELTA.equalsIgnoreCase(messageType)
+                || TYPE_SYNC_STATE.equalsIgnoreCase(messageType)) {
+            version = extractPlayersVersion(envelope);
+        }
+
+        if (version != null && version >= 0) {
+            lastKnownPlayersVersion = version;
+        }
+    }
+
+    private Integer extractSnapshotPlayersVersion(Map<?, ?> envelope) {
+        Object playersObject = extractEnvelopeValue(envelope, "players");
+        if (playersObject instanceof Map<?, ?> playersMap) {
+            return asInteger(playersMap.get("version"));
+        }
+        return null;
+    }
+
+    private Integer extractPlayersVersion(Map<?, ?> envelope) {
+        return asInteger(extractEnvelopeValue(envelope, "players_version"));
+    }
+
+    private Object extractEnvelopeValue(Map<?, ?> envelope, String key) {
+        if (envelope == null || key == null || key.isBlank()) {
+            return null;
+        }
+
+        Object data = envelope.get("data");
+        if (data instanceof Map<?, ?> dataMap && dataMap.containsKey(key)) {
+            return dataMap.get(key);
+        }
+
+        Object payload = envelope.get("payload");
+        if (payload instanceof Map<?, ?> payloadMap && payloadMap.containsKey(key)) {
+            return payloadMap.get(key);
+        }
+
+        return envelope.get(key);
     }
 
     private String resolveAckRequestId(Map<?, ?> envelope) {
@@ -1014,6 +1068,30 @@ public class WebSocketSyncManager {
         Object payload = envelope.get("payload");
         if (payload instanceof Map<?, ?> payloadMap) {
             return asNonBlankString(payloadMap.get("requestId"));
+        }
+        return null;
+    }
+
+    private void sendPong() {
+        if (!enabled || !started.get() || !isConnectionReady()) {
+            return;
+        }
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("queuedMessages", queuedSize());
+        payload.put("receivedAt", System.currentTimeMillis());
+        enqueueMessage(createSuccessEnvelope(TYPE_PONG, payload));
+    }
+
+    private Integer asInteger(Object value) {
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        if (value instanceof String raw && !raw.isBlank()) {
+            try {
+                return Integer.parseInt(raw);
+            } catch (NumberFormatException ignored) {
+            }
         }
         return null;
     }
@@ -1115,12 +1193,12 @@ public class WebSocketSyncManager {
     }
 
     private record PlayersDelta(
-            List<Map<String, Object>> added,
-            List<Map<String, Object>> removed,
-            List<Map<String, Object>> updated
+            List<Map<String, Object>> add,
+            List<Map<String, Object>> remove,
+            List<Map<String, Object>> update
     ) {
         private boolean isEmpty() {
-            return added.isEmpty() && removed.isEmpty() && updated.isEmpty();
+            return add.isEmpty() && remove.isEmpty() && update.isEmpty();
         }
     }
 
