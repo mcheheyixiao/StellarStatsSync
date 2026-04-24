@@ -8,11 +8,16 @@ load: POSTWORLD
 
 commands:
   statsync:
-    description: "Manual sync of player statistics to MySQL"
-    usage: "/statsync sync"
-    permission: stellarstats.admin
+    description: "Player stats operations and runtime status"
+    usage: "/statsync <sync|status>"
+    permission: stellarstatsync.admin
 
 permissions:
-  stellarstats.admin:
-    description: "Allows using /statsync sync"
+  stellarstatsync.admin:
+    description: "Allows using /statsync sync and /statsync status"
     default: op
+  stellarstats.admin:
+    description: "Legacy alias of stellarstatsync.admin"
+    default: false
+    children:
+      stellarstatsync.admin: true

@@ -53,7 +53,7 @@ public class StellarStatsSync extends JavaPlugin {
 
         PluginCommand statsyncCommand = getCommand("statsync");
         if (statsyncCommand != null) {
-            statsyncCommand.setExecutor(new StatsyncCommand(this, syncTask));
+            statsyncCommand.setExecutor(new StatsyncCommand(this, syncTask, webSocketSyncManager));
         } else {
             getLogger().warning("Command 'statsync' not found in plugin.yml");
         }

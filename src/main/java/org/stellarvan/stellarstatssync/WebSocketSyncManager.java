@@ -44,6 +44,7 @@ public class WebSocketSyncManager {
     private static final String TYPE_SNAPSHOT_REQUEST = "snapshot_request";
     private static final String TYPE_SYNC_STATE = "sync_state";
     private static final String TYPE_ERROR = "error";
+    private static final long QUEUE_WARN_INTERVAL_MILLIS = 60_000L;
     private static final long PENDING_ACK_TTL_MILLIS = 30_000L;
     private static final long PENDING_ACK_WARN_INTERVAL_MILLIS = 60_000L;
     private static final int PENDING_ACK_RESTORE_LIMIT = 32;
@@ -88,6 +89,8 @@ public class WebSocketSyncManager {
     private volatile long lastPongAt = 0L;
     private volatile int reconnectFailures = 0;
     private volatile long lastConnectedAt = 0L;
+    private volatile String lastReconnectReason = "none";
+    private volatile long lastQueueWarnAt = 0L;
     private volatile long lastPendingAckCacheWarnAt = 0L;
     private volatile BukkitTask heartbeatTask;
     private volatile BukkitTask reportTask;
@@ -165,6 +168,39 @@ public class WebSocketSyncManager {
     @SuppressWarnings("unused")
     public boolean isSyncPlayerJoinQuitEnabled() {
         return enabled && syncPlayerJoinQuit;
+    }
+
+    public int getQueueSize() {
+        return queuedSize();
+    }
+
+    public int getPendingAckSize() {
+        return pendingAckSize();
+    }
+
+    public long getLastPongAt() {
+        return lastPongAt;
+    }
+
+    public int getReconnectFailures() {
+        return reconnectFailures;
+    }
+
+    public int getLastKnownPlayersVersion() {
+        return lastKnownPlayersVersion;
+    }
+
+    public boolean isConnected() {
+        return this.webSocket != null;
+    }
+
+    public String getLastReconnectReason() {
+        String reason = lastReconnectReason;
+        return reason == null || reason.isBlank() ? "none" : reason;
+    }
+
+    public String getMaskedEndpoint() {
+        return maskSensitiveQueryParams(endpoint.toString());
     }
 
     public void start() {
@@ -443,7 +479,7 @@ public class WebSocketSyncManager {
         }
 
         if (dropped > 0) {
-            logWarn("Message queue exceeded limit (" + queueLimit + "), dropped oldest messages: " + dropped);
+            logQueueWarnWithRateLimit("Message queue exceeded limit (" + queueLimit + "), dropped oldest messages: " + dropped);
         }
 
         flushQueue();
@@ -464,7 +500,7 @@ public class WebSocketSyncManager {
         }
 
         if (dropped > 0) {
-            logWarn("Message queue exceeded limit (" + queueLimit + "), dropped newest messages: " + dropped);
+            logQueueWarnWithRateLimit("Message queue exceeded limit (" + queueLimit + "), dropped newest messages: " + dropped);
         }
     }
 
@@ -601,7 +637,7 @@ public class WebSocketSyncManager {
     }
 
     private void logOutboundEnvelope(MessageEnvelope message, String json) {
-        if (!isVerboseLoggingEnabled()) {
+        if (!isProtocolDetailLoggingEnabled()) {
             return;
         }
         int size = json.getBytes(StandardCharsets.UTF_8).length;
@@ -609,7 +645,7 @@ public class WebSocketSyncManager {
     }
 
     private void logSendFailureEnvelope(String requestId) {
-        if (!isVerboseLoggingEnabled()) {
+        if (!isProtocolDetailLoggingEnabled()) {
             return;
         }
         // Fixed values kept intentionally for protocol-consistent error reporting.
@@ -621,6 +657,7 @@ public class WebSocketSyncManager {
     }
 
     private void scheduleReconnect(String cause) {
+        lastReconnectReason = cause == null || cause.isBlank() ? "unknown" : cause;
         //noinspection ConstantConditions
         if (!enabled || !started.get() || plugin.isShuttingDown()) {
             return;
@@ -943,7 +980,7 @@ public class WebSocketSyncManager {
             logDebug("Restored pending ACK messages to queue: " + restored);
         }
         if (dropped > 0) {
-            logWarn("Queue limit reached while restoring pending ACK messages, dropped: " + dropped);
+            logQueueWarnWithRateLimit("Queue limit reached while restoring pending ACK messages, dropped: " + dropped);
         }
     }
 
@@ -977,6 +1014,7 @@ public class WebSocketSyncManager {
         synchronized (pendingAckLock) {
             pendingAckMessages.clear();
             pendingAckCreatedAt.clear();
+            lastQueueWarnAt = 0L;
             lastPendingAckCacheWarnAt = 0L;
         }
         synchronized (playerStateLock) {
@@ -1122,6 +1160,29 @@ public class WebSocketSyncManager {
         }
     }
 
+    private void logQueueWarnWithRateLimit(String message) {
+        long now = System.currentTimeMillis();
+        boolean shouldWarn;
+        synchronized (queueLock) {
+            shouldWarn = now - lastQueueWarnAt >= QUEUE_WARN_INTERVAL_MILLIS;
+            if (shouldWarn) {
+                lastQueueWarnAt = now;
+            }
+        }
+        if (shouldWarn) {
+            logWarn(message);
+        } else {
+            logDebug(message + " (suppressed by 60s rate limit)");
+        }
+    }
+
+    private String maskSensitiveQueryParams(String url) {
+        if (url == null || url.isBlank()) {
+            return "";
+        }
+        return url.replaceAll("(?i)([?&](token|auth_token)=)[^&]*", "$1****");
+    }
+
     private void sendPong() {
         if (!enabled || !started.get() || !isConnectionReady()) {
             return;
@@ -1224,6 +1285,10 @@ public class WebSocketSyncManager {
         return debugVerbose || wsDebug || StellarStatsSync.isDebug();
     }
 
+    private boolean isProtocolDetailLoggingEnabled() {
+        return debugVerbose;
+    }
+
     private void logInfo(String message) {
         plugin.getLogger().info("[WebSocket] " + message);
     }
@@ -1268,7 +1333,7 @@ public class WebSocketSyncManager {
             if (last) {
                 String payload = frameBuffer.toString();
                 frameBuffer.setLength(0);
-                if (isVerboseLoggingEnabled()) {
+                if (isProtocolDetailLoggingEnabled()) {
                     logDebug("Inbound message: " + payload);
                 }
                 handleInboundMessage(payload);
