@@ -24,7 +24,7 @@ websocket:
   auth_token: "CHANGE_ME"
   reconnect_interval_seconds: 5
   heartbeat_interval_seconds: 20
-  report_interval_seconds: 2
+  report_interval_seconds: 5
   sync_chat: true
   sync_player_join_quit: true
   sync_plugin_status: true
