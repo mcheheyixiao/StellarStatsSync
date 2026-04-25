@@ -4,6 +4,7 @@ import com.google.gson.Gson;
 import org.bukkit.Bukkit;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.entity.Player;
+import org.bukkit.plugin.Plugin;
 import org.bukkit.scheduler.BukkitTask;
 import org.stellarvan.stellarstatssync.websocket.dto.MessageEnvelope;
 
@@ -17,9 +18,11 @@ import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -44,6 +47,8 @@ public class WebSocketSyncManager {
     private static final String TYPE_SNAPSHOT_REQUEST = "snapshot_request";
     private static final String TYPE_SYNC_STATE = "sync_state";
     private static final String TYPE_ERROR = "error";
+    private static final int MAX_PLUGINS_PER_UPDATE = 300;
+    private static final long PLUGINS_UPDATE_DEBOUNCE_TICKS = 40L;
     private static final long QUEUE_WARN_INTERVAL_MILLIS = 60_000L;
     private static final long PENDING_ACK_TTL_MILLIS = 30_000L;
     private static final long PENDING_ACK_WARN_INTERVAL_MILLIS = 60_000L;
@@ -62,6 +67,10 @@ public class WebSocketSyncManager {
     private final long reportIntervalTicks;
     private final boolean syncChat;
     private final boolean syncPlayerJoinQuit;
+    private final boolean syncPluginStatus;
+    private final long pluginsReportIntervalTicks;
+    private final boolean includePluginDescription;
+    private final boolean includePluginAuthors;
     private final boolean wsDebug;
     private final boolean suppressNormalReconnect;
     private final int reconnectWarnThreshold;
@@ -94,6 +103,8 @@ public class WebSocketSyncManager {
     private volatile long lastPendingAckCacheWarnAt = 0L;
     private volatile BukkitTask heartbeatTask;
     private volatile BukkitTask reportTask;
+    private volatile BukkitTask pluginsReportTask;
+    private volatile BukkitTask pluginsDebounceTask;
 
     public WebSocketSyncManager(StellarStatsSync plugin) {
         this.plugin = plugin;
@@ -141,6 +152,18 @@ public class WebSocketSyncManager {
 
         this.syncChat = ws == null || ws.getBoolean("sync_chat", true);
         this.syncPlayerJoinQuit = ws == null || ws.getBoolean("sync_player_join_quit", true);
+        ConfigurationSection realtime = plugin.getConfig().getConfigurationSection("realtime");
+        ConfigurationSection pluginsStatus = realtime != null ? realtime.getConfigurationSection("plugins-status") : null;
+        boolean legacySyncPluginStatus = ws == null || ws.getBoolean("sync_plugin_status", true);
+        this.syncPluginStatus = pluginsStatus != null
+                ? pluginsStatus.getBoolean("enabled", legacySyncPluginStatus)
+                : legacySyncPluginStatus;
+        long pluginsIntervalSeconds = pluginsStatus != null
+                ? pluginsStatus.getLong("interval-seconds", 60L)
+                : 60L;
+        this.pluginsReportIntervalTicks = Math.max(30L, pluginsIntervalSeconds) * TICKS_PER_SECOND;
+        this.includePluginDescription = pluginsStatus != null && pluginsStatus.getBoolean("include-description", false);
+        this.includePluginAuthors = pluginsStatus != null && pluginsStatus.getBoolean("include-authors", false);
         this.wsDebug = ws != null && ws.getBoolean("debug", false);
         ConfigurationSection wsLog = ws != null ? ws.getConfigurationSection("log") : null;
         this.suppressNormalReconnect = wsLog == null || wsLog.getBoolean("suppress_normal_reconnect", true);
@@ -168,6 +191,10 @@ public class WebSocketSyncManager {
     @SuppressWarnings("unused")
     public boolean isSyncPlayerJoinQuitEnabled() {
         return enabled && syncPlayerJoinQuit;
+    }
+
+    public boolean isPluginStatusSyncEnabled() {
+        return enabled && syncPluginStatus;
     }
 
     public int getQueueSize() {
@@ -221,6 +248,14 @@ public class WebSocketSyncManager {
                 reportIntervalTicks,
                 reportIntervalTicks
         );
+        if (syncPluginStatus) {
+            this.pluginsReportTask = Bukkit.getScheduler().runTaskTimer(
+                    plugin,
+                    this::sendPluginsSnapshot,
+                    TICKS_PER_SECOND * 10L,
+                    pluginsReportIntervalTicks
+            );
+        }
 
         connectAsync("initial_start");
     }
@@ -232,8 +267,12 @@ public class WebSocketSyncManager {
 
         cancelTask(heartbeatTask);
         cancelTask(reportTask);
+        cancelTask(pluginsReportTask);
+        cancelTask(pluginsDebounceTask);
         heartbeatTask = null;
         reportTask = null;
+        pluginsReportTask = null;
+        pluginsDebounceTask = null;
 
         reconnectScheduled.set(false);
         connecting.set(false);
@@ -309,6 +348,98 @@ public class WebSocketSyncManager {
         payload.put("update", delta.update());
         payload.put("onlineCount", currentPlayers.size());
         enqueueMessage(createSuccessEnvelope(TYPE_PLAYERS_DELTA, payload));
+    }
+
+    public void schedulePluginsUpdateDebounced() {
+        schedulePluginsUpdateDebounced(PLUGINS_UPDATE_DEBOUNCE_TICKS);
+    }
+
+    public void schedulePluginsUpdateDebounced(long delayTicks) {
+        if (!enabled || !syncPluginStatus || !started.get()) {
+            return;
+        }
+
+        long safeDelay = Math.max(1L, delayTicks);
+        Runnable scheduleTask = () -> {
+            BukkitTask existingTask = pluginsDebounceTask;
+            if (existingTask != null) {
+                existingTask.cancel();
+            }
+            pluginsDebounceTask = Bukkit.getScheduler().runTaskLater(plugin, () -> {
+                pluginsDebounceTask = null;
+                sendPluginsSnapshot();
+            }, safeDelay);
+        };
+
+        if (Bukkit.isPrimaryThread()) {
+            scheduleTask.run();
+        } else {
+            Bukkit.getScheduler().runTask(plugin, scheduleTask);
+        }
+    }
+
+    private void sendPluginsSnapshot() {
+        if (!enabled || !started.get() || !syncPluginStatus) {
+            return;
+        }
+        if (!Bukkit.isPrimaryThread()) {
+            Bukkit.getScheduler().runTask(plugin, this::sendPluginsSnapshot);
+            return;
+        }
+        if (!isConnectionReady()) {
+            return;
+        }
+
+        List<Map<String, Object>> plugins = collectPluginStatuses();
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("plugins", plugins);
+        payload.put("timestamp", System.currentTimeMillis());
+        sendPluginsUpdate(payload);
+        logDebug("Sent plugins_update: " + plugins.size() + " plugins");
+    }
+
+    private List<Map<String, Object>> collectPluginStatuses() {
+        Plugin[] installedPlugins = Bukkit.getPluginManager().getPlugins();
+        List<Plugin> sortedPlugins = new ArrayList<>(installedPlugins.length);
+        for (Plugin pluginEntry : installedPlugins) {
+            if (pluginEntry != null) {
+                sortedPlugins.add(pluginEntry);
+            }
+        }
+        sortedPlugins.sort(Comparator.comparing(pluginEntry -> pluginEntry.getName().toLowerCase(Locale.ROOT)));
+
+        int limit = Math.min(MAX_PLUGINS_PER_UPDATE, sortedPlugins.size());
+        List<Map<String, Object>> pluginStatuses = new ArrayList<>(limit);
+        for (int i = 0; i < limit; i++) {
+            Plugin pluginEntry = sortedPlugins.get(i);
+            Map<String, Object> pluginStatus = new LinkedHashMap<>();
+            pluginStatus.put("name", pluginEntry.getName());
+            pluginStatus.put("version", resolvePluginVersion(pluginEntry));
+            pluginStatus.put("enabled", pluginEntry.isEnabled());
+
+            if (includePluginDescription) {
+                String description = pluginEntry.getDescription().getDescription();
+                if (description != null && !description.isBlank()) {
+                    pluginStatus.put("description", description);
+                }
+            }
+            if (includePluginAuthors) {
+                List<String> authors = pluginEntry.getDescription().getAuthors();
+                if (authors != null && !authors.isEmpty()) {
+                    pluginStatus.put("authors", new ArrayList<>(authors));
+                }
+            }
+            pluginStatuses.add(pluginStatus);
+        }
+        return pluginStatuses;
+    }
+
+    private String resolvePluginVersion(Plugin pluginEntry) {
+        String version = pluginEntry.getDescription().getVersion();
+        if (version == null || version.isBlank()) {
+            return "unknown";
+        }
+        return version;
     }
 
     @SuppressWarnings("unused")
@@ -598,6 +729,7 @@ public class WebSocketSyncManager {
                     sendSyncState();
                     sendStatsSnapshot();
                     sendPlayersDelta();
+                    sendPluginsSnapshot();
                     restorePendingAckMessagesToQueue();
                 });
             } else {

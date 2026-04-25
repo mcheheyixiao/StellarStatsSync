@@ -27,6 +27,7 @@ websocket:
   report_interval_seconds: 5
   sync_chat: true
   sync_player_join_quit: true
+  # Legacy toggle for plugins_update. Will be merged with realtime.plugins-status.enabled.
   sync_plugin_status: true
   debug: false
   log:
@@ -36,3 +37,10 @@ websocket:
     debug_verbose: false
   queue_limit: 1024
   connect_timeout_seconds: 10
+
+realtime:
+  plugins-status:
+    enabled: true
+    interval-seconds: 60
+    include-description: false
+    include-authors: false

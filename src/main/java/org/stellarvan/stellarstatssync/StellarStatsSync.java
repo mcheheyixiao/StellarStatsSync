@@ -46,6 +46,7 @@ public class StellarStatsSync extends JavaPlugin {
         if (webSocketSyncManager.isEnabled()) {
             webSocketSyncManager.start();
             getServer().getPluginManager().registerEvents(new RealtimeSyncListener(this, webSocketSyncManager), this);
+            getServer().getPluginManager().registerEvents(new PluginStatusListener(this, webSocketSyncManager), this);
             getLogger().info("WebSocket realtime sync enabled.");
         } else {
             getLogger().info("WebSocket realtime sync disabled by config.");
