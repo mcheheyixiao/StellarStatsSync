@@ -11,6 +11,7 @@ import org.stellarvan.stellarstatssync.websocket.dto.MessageEnvelope;
 import java.lang.management.ManagementFactory;
 import java.lang.reflect.Method;
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
 import java.nio.charset.StandardCharsets;
@@ -119,14 +120,22 @@ public class WebSocketSyncManager {
         //noinspection ConstantConditions
         this.serverName = configuredServerName == null || configuredServerName.isBlank() ? "default" : configuredServerName.trim();
 
-        String wsUrl = ws != null ? ws.getString("ws_url", "").trim() : "";
+        String wsUrlRaw = ws != null ? ws.getString("ws_url", "") : "";
+        String wsUrl = wsUrlRaw == null ? "" : wsUrlRaw.trim();
         if (wsUrl.isEmpty()) {
-            String serverUrl = ws != null ? ws.getString("server_url", "ws://127.0.0.1:3001").trim() : "ws://127.0.0.1:3001";
-            String path = ws != null ? ws.getString("path", "/plugin").trim() : "/plugin";
+            String serverUrlRaw = ws != null ? ws.getString("server_url", "ws://127.0.0.1:3001") : "ws://127.0.0.1:3001";
+            String serverUrl = serverUrlRaw == null || serverUrlRaw.isBlank() ? "ws://127.0.0.1:3001" : serverUrlRaw.trim();
+            String pathRaw = ws != null ? ws.getString("path", "/ws/plugin") : "/ws/plugin";
+            String path = pathRaw == null || pathRaw.isBlank() ? "/ws/plugin" : pathRaw.trim();
             wsUrl = buildWsUrl(serverUrl, path);
         }
+        String authTokenRaw = ws != null ? ws.getString("auth_token", "") : "";
+        String authToken = authTokenRaw == null ? "" : authTokenRaw.trim();
+        if (!authToken.isBlank()) {
+            wsUrl = appendTokenQueryParam(wsUrl, authToken);
+        }
 
-        URI parsedEndpoint = URI.create("ws://127.0.0.1:3001/plugin");
+        URI parsedEndpoint = URI.create("ws://127.0.0.1:3001/ws/plugin");
         if (enabledFlag) {
             try {
                 parsedEndpoint = URI.create(wsUrl);
@@ -469,7 +478,7 @@ public class WebSocketSyncManager {
             return;
         }
 
-        logDebug("Connecting to " + endpoint + " (" + reason + ")");
+        logDebug("Connecting to " + getMaskedEndpoint() + " (" + reason + ")");
 
         httpClient.newWebSocketBuilder()
                 .connectTimeout(Duration.ofSeconds(connectTimeoutSeconds))
@@ -1350,6 +1359,23 @@ public class WebSocketSyncManager {
         String normalizedServerUrl = serverUrl.endsWith("/") ? serverUrl.substring(0, serverUrl.length() - 1) : serverUrl;
         String normalizedPath = path.startsWith("/") ? path : "/" + path;
         return normalizedServerUrl + normalizedPath;
+    }
+
+    private static String appendTokenQueryParam(String wsUrl, String token) {
+        if (wsUrl == null || wsUrl.isBlank() || token == null || token.isBlank()) {
+            return wsUrl;
+        }
+        String lower = wsUrl.toLowerCase(Locale.ROOT);
+        if (lower.contains("?token=") || lower.contains("&token=")
+                || lower.contains("?auth_token=") || lower.contains("&auth_token=")) {
+            return wsUrl;
+        }
+
+        int fragmentIndex = wsUrl.indexOf('#');
+        String base = fragmentIndex >= 0 ? wsUrl.substring(0, fragmentIndex) : wsUrl;
+        String fragment = fragmentIndex >= 0 ? wsUrl.substring(fragmentIndex) : "";
+        String separator = base.contains("?") ? "&" : "?";
+        return base + separator + "token=" + URLEncoder.encode(token, StandardCharsets.UTF_8) + fragment;
     }
 
     private static double round(double value) {

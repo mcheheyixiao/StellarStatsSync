@@ -12,15 +12,17 @@ mysql:
 sync_interval_ticks: 12000
 
 websocket:
+  # Keep disabled by default. To make StellarWorld show Plugin Online,
+  # set websocket.enabled=true and make auth_token match one of StellarRealtime PLUGIN_TOKENS.
   enabled: false
   # Optional full address. If set, this value has priority.
-  ws_url: "ws://127.0.0.1:3001/plugin"
+  ws_url: "ws://127.0.0.1:3001/ws/plugin"
   # Optional split mode. Used when ws_url is empty.
   server_url: "ws://127.0.0.1:3001"
-  path: "/plugin"
+  path: "/ws/plugin"
   server_id: "default"
   server_name: "default"
-  # Deprecated for StellarRealtime protocol, kept for backward compatibility.
+  # Realtime auth token (legacy key name kept for backward compatibility).
   auth_token: "CHANGE_ME"
   reconnect_interval_seconds: 5
   heartbeat_interval_seconds: 20

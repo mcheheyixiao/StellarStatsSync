@@ -132,7 +132,14 @@ StellarStatsSync 由四个核心模块组成：
 - `websocket.log.reconnect_error_threshold`
 - `websocket.log.debug_verbose`
 
-## 7. 性能策略
+## 7. Realtime default notes
+
+- Default `websocket.ws_url`: `ws://127.0.0.1:3001/ws/plugin`
+- Default `websocket.path`: `/ws/plugin`
+- `websocket.enabled` remains `false` by default.
+- To make StellarWorld backend show Plugin Online, set `websocket.enabled=true` and set `websocket.auth_token` to one of StellarRealtime `PLUGIN_TOKENS`.
+
+## 8. 性能策略
 
 - Bukkit 统计采集在主线程执行，数据库 I/O 在异步线程执行。
 - WebSocket 发送链路使用异步串行发送，避免并发写 socket。

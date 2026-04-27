@@ -87,6 +87,9 @@ public class StatsyncCommand implements CommandExecutor {
 
         WebSocketSyncManager manager = this.webSocketSyncManager;
         String webSocketState = "unavailable";
+        boolean webSocketEnabled = false;
+        boolean connected = false;
+        boolean pluginStatusSyncEnabled = false;
         String endpoint = "-";
         int queueSize = 0;
         int pendingAck = 0;
@@ -96,9 +99,12 @@ public class StatsyncCommand implements CommandExecutor {
         int playersVersion = 0;
 
         if (manager != null) {
-            if (!manager.isEnabled()) {
+            webSocketEnabled = manager.isEnabled();
+            connected = manager.isConnected();
+            pluginStatusSyncEnabled = manager.isPluginStatusSyncEnabled();
+            if (!webSocketEnabled) {
                 webSocketState = "disabled";
-            } else if (manager.isConnected()) {
+            } else if (connected) {
                 webSocketState = "connected";
             } else {
                 webSocketState = "disconnected";
@@ -114,12 +120,15 @@ public class StatsyncCommand implements CommandExecutor {
 
         sender.sendMessage("[StellarStatsSync]");
         sender.sendMessage("WebSocket: " + webSocketState);
+        sender.sendMessage("WebSocket enabled: " + webSocketEnabled);
+        sender.sendMessage("Connected: " + connected);
         sender.sendMessage("Endpoint: " + endpoint);
         sender.sendMessage("Queue size: " + queueSize);
         sender.sendMessage("Pending ACK: " + pendingAck);
         sender.sendMessage("Last pong: " + formatDurationAgo(lastPongAt));
         sender.sendMessage("Reconnect failures: " + reconnectFailures);
         sender.sendMessage("Last reconnect reason: " + (lastReconnectReason == null || lastReconnectReason.isBlank() ? "none" : lastReconnectReason));
+        sender.sendMessage("Plugin status sync enabled: " + pluginStatusSyncEnabled);
         sender.sendMessage("Players version: " + playersVersion);
     }
 
