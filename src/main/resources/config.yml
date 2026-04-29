@@ -40,6 +40,17 @@ websocket:
   queue_limit: 1024
   connect_timeout_seconds: 10
 
+checkin:
+  enabled: true
+  api-base-url: "https://www.stellarvan.cn"
+  token: "CHANGE_ME"
+  poll-interval-seconds: 15
+  batch-size: 20
+  command-dispatcher: "console"
+  retry-failed: true
+  request-timeout-seconds: 8
+  debug: false
+
 realtime:
   plugins-status:
     enabled: true

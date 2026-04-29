@@ -14,6 +14,7 @@ public class StellarStatsSync extends JavaPlugin {
     private DatabaseManager databaseManager;
     private SyncTask syncTask;
     private WebSocketSyncManager webSocketSyncManager;
+    private CheckinRewardPoller checkinRewardPoller;
 
     public static boolean isDebug() {
         return DEBUG;
@@ -42,6 +43,7 @@ public class StellarStatsSync extends JavaPlugin {
 
         getServer().getPluginManager().registerEvents(new PlayerQuitListener(this, syncTask, databaseManager), this);
         this.webSocketSyncManager = new WebSocketSyncManager(this);
+        this.checkinRewardPoller = new CheckinRewardPoller(this);
 
         if (webSocketSyncManager.isEnabled()) {
             webSocketSyncManager.start();
@@ -51,6 +53,8 @@ public class StellarStatsSync extends JavaPlugin {
         } else {
             getLogger().info("WebSocket realtime sync disabled by config.");
         }
+
+        checkinRewardPoller.start();
 
         PluginCommand statsyncCommand = getCommand("statsync");
         if (statsyncCommand != null) {
@@ -67,6 +71,9 @@ public class StellarStatsSync extends JavaPlugin {
         this.isShuttingDown = true;
         if (webSocketSyncManager != null) {
             webSocketSyncManager.shutdown();
+        }
+        if (checkinRewardPoller != null) {
+            checkinRewardPoller.shutdown();
         }
         if (syncTask != null) {
             syncTask.performSyncSyncOnDisable();
