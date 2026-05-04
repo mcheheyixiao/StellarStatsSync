@@ -1,6 +1,7 @@
 package org.stellarvan.stellarstatssync;
 
 import com.google.gson.Gson;
+import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Bukkit;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.entity.Player;
@@ -59,6 +60,9 @@ public class WebSocketSyncManager {
     private static final long PENDING_ACK_WARN_INTERVAL_MILLIS = 60_000L;
     private static final int PENDING_ACK_RESTORE_LIMIT = 32;
     private static final long MAX_MINIMOTD_CONFIG_BYTES = 128L * 1024L;
+    private static final long MINIMOTD_CACHE_TTL_MILLIS = 30_000L;
+    private static final long MINIMOTD_WARN_INTERVAL_MILLIS = 60_000L;
+    private static final PlainTextComponentSerializer PLAIN_TEXT_SERIALIZER = PlainTextComponentSerializer.plainText();
     private static final Pattern MINI_MESSAGE_TAG_PATTERN = Pattern.compile("<[^>]*>");
     private static final Pattern LEGACY_SECTION_COLOR_PATTERN = Pattern.compile("(?i)§[0-9A-FK-ORX]");
     private static final Pattern LEGACY_AMPERSAND_COLOR_PATTERN = Pattern.compile("(?i)&[0-9A-FK-ORX]");
@@ -101,6 +105,7 @@ public class WebSocketSyncManager {
     private final AtomicBoolean connecting = new AtomicBoolean(false);
     private final AtomicBoolean reconnectScheduled = new AtomicBoolean(false);
     private final AtomicBoolean flushRunning = new AtomicBoolean(false);
+    private final AtomicBoolean miniMotdReloading = new AtomicBoolean(false);
 
     private volatile WebSocket webSocket;
     private volatile boolean authDelivered;
@@ -111,6 +116,9 @@ public class WebSocketSyncManager {
     private volatile String lastReconnectReason = "none";
     private volatile long lastQueueWarnAt = 0L;
     private volatile long lastPendingAckCacheWarnAt = 0L;
+    private volatile long lastMiniMotdReadWarnAt = 0L;
+    private volatile String cachedMiniMotdText = "";
+    private volatile long cachedMiniMotdReadAt = 0L;
     private volatile BukkitTask heartbeatTask;
     private volatile BukkitTask reportTask;
     private volatile BukkitTask pluginsReportTask;
@@ -436,13 +444,13 @@ public class WebSocketSyncManager {
             pluginStatus.put("enabled", pluginEntry.isEnabled());
 
             if (includePluginDescription) {
-                String description = pluginEntry.getDescription().getDescription();
+                String description = resolvePluginDescription(pluginEntry);
                 if (description != null && !description.isBlank()) {
                     pluginStatus.put("description", description);
                 }
             }
             if (includePluginAuthors) {
-                List<String> authors = pluginEntry.getDescription().getAuthors();
+                List<String> authors = resolvePluginAuthors(pluginEntry);
                 if (authors != null && !authors.isEmpty()) {
                     pluginStatus.put("authors", new ArrayList<>(authors));
                 }
@@ -453,11 +461,20 @@ public class WebSocketSyncManager {
     }
 
     private String resolvePluginVersion(Plugin pluginEntry) {
-        String version = pluginEntry.getDescription().getVersion();
+        String version = pluginEntry.getPluginMeta().getVersion();
         if (version == null || version.isBlank()) {
             return "unknown";
         }
         return version;
+    }
+
+    private String resolvePluginDescription(Plugin pluginEntry) {
+        String description = pluginEntry.getPluginMeta().getDescription();
+        return description == null ? "" : description;
+    }
+
+    private List<String> resolvePluginAuthors(Plugin pluginEntry) {
+        return pluginEntry.getPluginMeta().getAuthors();
     }
 
     @SuppressWarnings("unused")
@@ -519,13 +536,12 @@ public class WebSocketSyncManager {
                 });
     }
 
-    @SuppressWarnings("deprecation")
     private void sendAuth() {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("serverId", serverId);
         payload.put("serverName", serverName);
         payload.put("platform", "bukkit");
-        payload.put("version", plugin.getDescription().getVersion());
+        payload.put("version", resolvePluginVersion(plugin));
 
         // Fixed values ("auth", true) keep auth-send semantics stable for protocol compatibility.
         sendDirect(createSuccessEnvelope(TYPE_AUTH, payload), "auth", true);
@@ -544,7 +560,6 @@ public class WebSocketSyncManager {
         enqueueMessage(createSuccessEnvelope(TYPE_HEARTBEAT, payload));
     }
 
-    @SuppressWarnings("deprecation")
     private void sendStatsSnapshot() {
         if (!enabled || !started.get()) {
             return;
@@ -708,7 +723,7 @@ public class WebSocketSyncManager {
     }
 
     private String resolveBukkitMotdMiniMessage(int onlinePlayers, int maxPlayers) {
-        String motd = Bukkit.getMotd();
+        String motd = PLAIN_TEXT_SERIALIZER.serialize(Bukkit.motd());
         if (motd == null || motd.isBlank()) {
             return "";
         }
@@ -739,11 +754,55 @@ public class WebSocketSyncManager {
             return "";
         }
         String selection = motdConfig != null ? motdConfig.getString("minimotd-selection", "first") : "first";
-        String normalizedSelection = selection == null ? "first" : selection.trim().toLowerCase(Locale.ROOT);
-        if (!"first".equals(normalizedSelection)) {
-            return readFirstMiniMotdFromMainConf();
+        if (selection != null && !selection.trim().equalsIgnoreCase("first")) {
+            logDebug("Unsupported realtime.motd.minimotd-selection value '" + selection + "', using 'first'.");
         }
-        return readFirstMiniMotdFromMainConf();
+
+        String cached = cachedMiniMotdText;
+        long now = System.currentTimeMillis();
+        if (!cached.isBlank() && now - cachedMiniMotdReadAt <= MINIMOTD_CACHE_TTL_MILLIS) {
+            return cached;
+        }
+
+        if (Bukkit.isPrimaryThread()) {
+            scheduleMiniMotdCacheRefresh();
+            return cached;
+        }
+        return refreshMiniMotdCache();
+    }
+
+    private void scheduleMiniMotdCacheRefresh() {
+        if (!miniMotdReloading.compareAndSet(false, true)) {
+            return;
+        }
+        Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                refreshMiniMotdCache();
+            } finally {
+                miniMotdReloading.set(false);
+            }
+        });
+    }
+
+    private String refreshMiniMotdCache() {
+        String parsed = readFirstMiniMotdFromMainConf();
+        cachedMiniMotdText = parsed == null ? "" : parsed;
+        cachedMiniMotdReadAt = System.currentTimeMillis();
+        if (cachedMiniMotdText.isBlank()) {
+            logMiniMotdWarnWithRateLimit("MiniMOTD detected but MOTD config could not be parsed; falling back to Bukkit MOTD.");
+        }
+        return cachedMiniMotdText;
+    }
+
+    private void logMiniMotdWarnWithRateLimit(String message) {
+        long now = System.currentTimeMillis();
+        boolean shouldWarn = now - lastMiniMotdReadWarnAt >= MINIMOTD_WARN_INTERVAL_MILLIS;
+        if (shouldWarn) {
+            lastMiniMotdReadWarnAt = now;
+            logWarn(message);
+            return;
+        }
+        logDebug(message + " (suppressed by 60s rate limit)");
     }
 
     private boolean isMiniMotdInstalled() {
