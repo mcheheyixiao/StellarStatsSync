@@ -5,6 +5,8 @@ api-version: "1.21"
 authors: [ StellarVan ]
 description: "Asynchronously syncs player statistics to a remote MySQL database using HikariCP."
 load: POSTWORLD
+softdepend:
+  - MiniMOTD
 
 commands:
   statsync:

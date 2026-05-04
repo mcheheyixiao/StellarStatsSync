@@ -15,6 +15,8 @@ import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -31,6 +33,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class WebSocketSyncManager {
 
@@ -54,6 +58,11 @@ public class WebSocketSyncManager {
     private static final long PENDING_ACK_TTL_MILLIS = 30_000L;
     private static final long PENDING_ACK_WARN_INTERVAL_MILLIS = 60_000L;
     private static final int PENDING_ACK_RESTORE_LIMIT = 32;
+    private static final long MAX_MINIMOTD_CONFIG_BYTES = 128L * 1024L;
+    private static final Pattern MINI_MESSAGE_TAG_PATTERN = Pattern.compile("<[^>]*>");
+    private static final Pattern LEGACY_SECTION_COLOR_PATTERN = Pattern.compile("(?i)§[0-9A-FK-ORX]");
+    private static final Pattern LEGACY_AMPERSAND_COLOR_PATTERN = Pattern.compile("(?i)&[0-9A-FK-ORX]");
+    private static final Pattern MULTI_SPACE_PATTERN = Pattern.compile("\\s{2,}");
 
     private final StellarStatsSync plugin;
     private final Gson gson;
@@ -541,48 +550,72 @@ public class WebSocketSyncManager {
             return;
         }
 
-        Map<String, Object> metrics = new LinkedHashMap<>();
-
         Collection<? extends Player> onlinePlayers = Bukkit.getOnlinePlayers();
-        metrics.put("onlinePlayers", onlinePlayers.size());
-        metrics.put("maxPlayers", Bukkit.getMaxPlayers());
+        int onlineCount = onlinePlayers.size();
+        int maxPlayers = Bukkit.getMaxPlayers();
+
+        Map<String, Object> metrics = new LinkedHashMap<>();
+        metrics.put("onlinePlayers", onlineCount);
+        metrics.put("maxPlayers", maxPlayers);
 
         List<Double> tpsValues = resolveTpsValues();
-        if (!tpsValues.isEmpty()) {
-            metrics.put("tps", tpsValues.getFirst());
-        }
+        metrics.put("tps", tpsValues.isEmpty() ? 0.0D : tpsValues.getFirst());
 
         Double mspt = resolveAverageMspt();
-        if (mspt != null) {
-            metrics.put("mspt", mspt);
-        }
+        metrics.put("mspt", mspt != null ? mspt : 0.0D);
         Double cpuUsage = resolveCpuUsagePercent();
-        if (cpuUsage != null) {
-            metrics.put("cpuUsage", cpuUsage);
-        }
+        metrics.put("cpuUsage", cpuUsage != null ? cpuUsage : 0.0D);
 
         Map<String, Object> jvmMemory = collectJvmMemory();
-        Object memoryUsedMb = jvmMemory.get("used_mb");
-        if (memoryUsedMb instanceof Number value) {
-            metrics.put("memoryUsedMb", value.longValue());
-        }
-        Object memoryMaxMb = jvmMemory.get("max_mb");
-        if (memoryMaxMb instanceof Number value) {
-            metrics.put("memoryMaxMb", value.longValue());
-        }
+        metrics.put("memoryUsedMb", asLongValue(jvmMemory.get("used_mb")));
+        metrics.put("memoryMaxMb", asLongValue(jvmMemory.get("max_mb")));
         metrics.put("uptimeSeconds", ManagementFactory.getRuntimeMXBean().getUptime() / 1000L);
 
-        Map<String, Object> serverInfo = new LinkedHashMap<>();
-        serverInfo.put("motd", Bukkit.getMotd());
-        if (!Bukkit.getWorlds().isEmpty()) {
-            serverInfo.put("world", Bukkit.getWorlds().getFirst().getName());
+        Map<String, Object> motdPayload = resolveMotdPayload();
+        String motdClean = asStringValue(motdPayload.get("clean"));
+        String motdSource = asStringValue(motdPayload.get("source"));
+
+        List<Map<String, Object>> playersList = new ArrayList<>(onlineCount);
+        for (Player player : onlinePlayers) {
+            Map<String, Object> playerDto = toPlayerDto(player);
+            String playerName = asStringValue(playerDto.get("name"));
+            if (playerName.isBlank()) {
+                playerName = player.getName() == null ? "" : player.getName();
+            }
+
+            Map<String, Object> publicPlayer = new LinkedHashMap<>();
+            publicPlayer.put("name", playerName);
+            publicPlayer.put("name_clean", stripMiniMessageToPlain(playerName));
+            publicPlayer.put("uuid", asStringValue(playerDto.get("uuid")));
+            playersList.add(publicPlayer);
         }
+
+        Map<String, Object> playersPayload = new LinkedHashMap<>();
+        playersPayload.put("online", onlineCount);
+        playersPayload.put("max", maxPlayers);
+        playersPayload.put("list", playersList);
+
+        Map<String, Object> serverInfo = new LinkedHashMap<>();
+        serverInfo.put("motd", motdClean);
+        Map<String, Object> motdObject = new LinkedHashMap<>();
+        motdObject.put("source", motdSource);
+        motdObject.put("clean", motdClean);
+        serverInfo.put("motdObject", motdObject);
+        String worldName = "";
+        if (!Bukkit.getWorlds().isEmpty() && Bukkit.getWorlds().getFirst() != null) {
+            worldName = Bukkit.getWorlds().getFirst().getName();
+        }
+        serverInfo.put("world", worldName);
         String host = Bukkit.getIp();
         //noinspection ConstantConditions
         String addressHost = (host == null || host.isBlank()) ? "0.0.0.0" : host;
         serverInfo.put("address", addressHost + ":" + Bukkit.getPort());
 
         Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("online", true);
+        payload.put("players", playersPayload);
+        payload.put("stats", metrics);
+        payload.put("motd", motdPayload);
         payload.put("metrics", metrics);
         payload.put("serverInfo", serverInfo);
 
@@ -602,6 +635,272 @@ public class WebSocketSyncManager {
         memory.put("total_mb", bytesToMb(total));
         memory.put("max_mb", bytesToMb(max));
         return memory;
+    }
+
+    private Map<String, Object> resolveMotdPayload() {
+        ConfigurationSection realtime = plugin.getConfig().getConfigurationSection("realtime");
+        ConfigurationSection motdConfig = realtime != null ? realtime.getConfigurationSection("motd") : null;
+
+        int onlinePlayers = Bukkit.getOnlinePlayers().size();
+        int maxPlayers = Bukkit.getMaxPlayers();
+        String configuredPlain = applyMotdPlaceholders(resolveConfiguredMotdPlain(motdConfig), onlinePlayers, maxPlayers);
+        String configuredMiniMessage = applyMotdPlaceholders(resolveConfiguredMiniMessage(motdConfig), onlinePlayers, maxPlayers);
+        String sourceMode = resolveMotdSourceMode(motdConfig);
+
+        if ("bukkit".equals(sourceMode)) {
+            return buildMotdPayload("bukkit", resolveBukkitMotdMiniMessage(onlinePlayers, maxPlayers), "");
+        }
+
+        if ("config".equals(sourceMode)) {
+            if (!configuredPlain.isBlank() || !configuredMiniMessage.isBlank()) {
+                return buildMotdPayload("config", configuredPlain, configuredMiniMessage);
+            }
+            return buildMotdPayload("bukkit", resolveBukkitMotdMiniMessage(onlinePlayers, maxPlayers), "");
+        }
+
+        if ("minimotd".equals(sourceMode)) {
+            String miniMotdText = applyMotdPlaceholders(resolveMiniMotdMiniMessage(motdConfig), onlinePlayers, maxPlayers);
+            if (!miniMotdText.isBlank()) {
+                return buildMotdPayload("minimotd", "", miniMotdText);
+            }
+            return buildMotdPayload("bukkit", resolveBukkitMotdMiniMessage(onlinePlayers, maxPlayers), "");
+        }
+
+        if (!configuredPlain.isBlank() || !configuredMiniMessage.isBlank()) {
+            return buildMotdPayload("config", configuredPlain, configuredMiniMessage);
+        }
+
+        String miniMotdText = applyMotdPlaceholders(resolveMiniMotdMiniMessage(motdConfig), onlinePlayers, maxPlayers);
+        if (!miniMotdText.isBlank()) {
+            return buildMotdPayload("minimotd", "", miniMotdText);
+        }
+        return buildMotdPayload("bukkit", resolveBukkitMotdMiniMessage(onlinePlayers, maxPlayers), "");
+    }
+
+    private Map<String, Object> buildMotdPayload(String source, String plainCandidate, String miniMessageCandidate) {
+        String safeSource = source == null || source.isBlank() ? "bukkit" : source;
+        String safePlainCandidate = plainCandidate == null ? "" : plainCandidate.trim();
+        String safeMiniMessage = miniMessageCandidate == null ? "" : miniMessageCandidate.trim();
+
+        String cleanPlain = !safePlainCandidate.isBlank()
+                ? stripMiniMessageToPlain(safePlainCandidate)
+                : stripMiniMessageToPlain(safeMiniMessage);
+
+        Map<String, Object> motdPayload = new LinkedHashMap<>();
+        motdPayload.put("source", safeSource);
+        motdPayload.put("clean", cleanPlain);
+        motdPayload.put("plain", cleanPlain);
+        motdPayload.put("miniMessage", safeMiniMessage);
+        motdPayload.put("html", "");
+        return motdPayload;
+    }
+
+    private String resolveMotdSourceMode(ConfigurationSection motdConfig) {
+        String configured = motdConfig != null ? motdConfig.getString("source", "auto") : "auto";
+        if (configured == null) {
+            return "auto";
+        }
+        String normalized = configured.trim().toLowerCase(Locale.ROOT);
+        return switch (normalized) {
+            case "config", "minimotd", "bukkit" -> normalized;
+            default -> "auto";
+        };
+    }
+
+    private String resolveBukkitMotdMiniMessage(int onlinePlayers, int maxPlayers) {
+        String motd = Bukkit.getMotd();
+        if (motd == null || motd.isBlank()) {
+            return "";
+        }
+        return applyMotdPlaceholders(motd, onlinePlayers, maxPlayers);
+    }
+
+    private String resolveConfiguredMotdPlain(ConfigurationSection motdConfig) {
+        if (motdConfig == null) {
+            return "";
+        }
+        String configured = motdConfig.getString("plain", "");
+        return configured == null ? "" : configured.trim();
+    }
+
+    private String resolveConfiguredMiniMessage(ConfigurationSection motdConfig) {
+        if (motdConfig == null) {
+            return "";
+        }
+        String configured = motdConfig.getString("mini-message", "");
+        return configured == null ? "" : configured.trim();
+    }
+
+    private String resolveMiniMotdMiniMessage(ConfigurationSection motdConfig) {
+        if (motdConfig != null && !motdConfig.getBoolean("read-minimotd-config", true)) {
+            return "";
+        }
+        if (!isMiniMotdInstalled()) {
+            return "";
+        }
+        String selection = motdConfig != null ? motdConfig.getString("minimotd-selection", "first") : "first";
+        String normalizedSelection = selection == null ? "first" : selection.trim().toLowerCase(Locale.ROOT);
+        if (!"first".equals(normalizedSelection)) {
+            return readFirstMiniMotdFromMainConf();
+        }
+        return readFirstMiniMotdFromMainConf();
+    }
+
+    private boolean isMiniMotdInstalled() {
+        Plugin miniMotd = Bukkit.getPluginManager().getPlugin("MiniMOTD");
+        return miniMotd != null && miniMotd.isEnabled();
+    }
+
+    private String readFirstMiniMotdFromMainConf() {
+        List<Path> candidatePaths = List.of(
+                Path.of("plugins", "MiniMOTD", "main.conf"),
+                Path.of("plugins", "MiniMOTD", "motd.conf")
+        );
+
+        for (Path candidatePath : candidatePaths) {
+            try {
+                if (!Files.isRegularFile(candidatePath)) {
+                    continue;
+                }
+                long size = Files.size(candidatePath);
+                if (size <= 0L || size > MAX_MINIMOTD_CONFIG_BYTES) {
+                    continue;
+                }
+
+                String content = Files.readString(candidatePath, StandardCharsets.UTF_8);
+                String parsed = extractFirstMotdFromConfContent(content);
+                if (!parsed.isBlank()) {
+                    return parsed;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return "";
+    }
+
+    private String extractFirstMotdFromConfContent(String content) {
+        if (content == null || content.isBlank()) {
+            return "";
+        }
+
+        String motdsBlock = firstGroup(content, "(?is)\\bmotds\\s*=\\s*\\[(.*?)]");
+        if (!motdsBlock.isBlank()) {
+            String firstEntry = firstGroup(motdsBlock, "(?is)\\{(.*?)}");
+            if (!firstEntry.isBlank()) {
+                String parsed = extractMotdTextFromScope(firstEntry);
+                if (!parsed.isBlank()) {
+                    return parsed;
+                }
+            }
+        }
+
+        return extractMotdTextFromScope(content);
+    }
+
+    private String extractMotdTextFromScope(String scope) {
+        String line1 = extractConfStringValue(scope, "line1");
+        String line2 = extractConfStringValue(scope, "line2");
+        if (!line1.isBlank() && !line2.isBlank()) {
+            return line1 + "\n" + line2;
+        }
+        if (!line1.isBlank()) {
+            return line1;
+        }
+        if (!line2.isBlank()) {
+            return line2;
+        }
+        return "";
+    }
+
+    private String extractConfStringValue(String content, String key) {
+        if (content == null || content.isBlank() || key == null || key.isBlank()) {
+            return "";
+        }
+
+        Pattern quotedPattern = Pattern.compile("(?is)\\b" + Pattern.quote(key) + "\\s*=\\s*\"((?:\\\\.|[^\"\\\\])*)\"");
+        Matcher quotedMatcher = quotedPattern.matcher(content);
+        if (quotedMatcher.find()) {
+            return decodeConfStringValue(quotedMatcher.group(1));
+        }
+
+        Pattern plainPattern = Pattern.compile("(?im)^\\s*" + Pattern.quote(key) + "\\s*=\\s*([^\\r\\n#]+)");
+        Matcher plainMatcher = plainPattern.matcher(content);
+        if (plainMatcher.find()) {
+            String value = plainMatcher.group(1);
+            if (value == null) {
+                return "";
+            }
+            value = value.trim().replaceAll("[,\\]}\\s]+$", "");
+            return decodeConfStringValue(value);
+        }
+        return "";
+    }
+
+    private String firstGroup(String input, String regex) {
+        if (input == null || input.isBlank() || regex == null || regex.isBlank()) {
+            return "";
+        }
+        Matcher matcher = Pattern.compile(regex).matcher(input);
+        if (matcher.find()) {
+            String group = matcher.group(1);
+            return group == null ? "" : group.trim();
+        }
+        return "";
+    }
+
+    private String decodeConfStringValue(String value) {
+        if (value == null || value.isBlank()) {
+            return "";
+        }
+        String decoded = value
+                .replace("\\n", "\n")
+                .replace("\\r", "\r")
+                .replace("\\t", "\t")
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\");
+        return decoded.trim();
+    }
+
+    private String stripMiniMessageToPlain(String input) {
+        if (input == null || input.isBlank()) {
+            return "";
+        }
+        String normalized = input.replace("\r\n", "\n").replace('\r', '\n');
+        String withoutTags = MINI_MESSAGE_TAG_PATTERN.matcher(normalized).replaceAll("");
+        withoutTags = LEGACY_SECTION_COLOR_PATTERN.matcher(withoutTags).replaceAll("");
+        withoutTags = LEGACY_AMPERSAND_COLOR_PATTERN.matcher(withoutTags).replaceAll("");
+        withoutTags = withoutTags.replace('\n', ' ');
+        withoutTags = MULTI_SPACE_PATTERN.matcher(withoutTags).replaceAll(" ");
+        return withoutTags.trim();
+    }
+
+    private String applyMotdPlaceholders(String input, int onlinePlayers, int maxPlayers) {
+        if (input == null || input.isBlank()) {
+            return "";
+        }
+        return input
+                .replace("{onlinePlayers}", String.valueOf(onlinePlayers))
+                .replace("{maxPlayers}", String.valueOf(maxPlayers));
+    }
+
+    private long asLongValue(Object value) {
+        if (value instanceof Number number) {
+            return number.longValue();
+        }
+        if (value instanceof String raw && !raw.isBlank()) {
+            try {
+                return Long.parseLong(raw);
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return 0L;
+    }
+
+    private String asStringValue(Object value) {
+        if (value == null) {
+            return "";
+        }
+        return String.valueOf(value);
     }
 
     private void enqueueMessage(MessageEnvelope message) {

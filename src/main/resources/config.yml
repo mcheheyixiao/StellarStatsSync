@@ -57,3 +57,22 @@ realtime:
     interval-seconds: 60
     include-description: false
     include-authors: false
+  motd:
+    # auto: config -> minimotd -> bukkit
+    # config: only use values below
+    # minimotd: best-effort read MiniMOTD config, fallback to bukkit
+    # bukkit: Bukkit.getMotd()
+    source: auto
+
+    # When source=auto or config, this override has highest priority if not empty.
+    plain: ""
+
+    # Optional MiniMessage text for website display.
+    mini-message: ""
+
+    # Whether to try reading plugins/MiniMOTD/main.conf when MiniMOTD is installed.
+    read-minimotd-config: true
+
+    # If MiniMOTD has multiple MOTDs, use first one for stable website display.
+    # Future: random can be added, but do not implement random now.
+    minimotd-selection: first
