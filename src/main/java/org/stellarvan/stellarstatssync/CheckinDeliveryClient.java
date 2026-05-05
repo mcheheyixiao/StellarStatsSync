@@ -41,8 +41,8 @@ final class CheckinDeliveryClient {
     }
 
     public CompletableFuture<List<Delivery>> fetchPendingDeliveries(int limit) {
-        URI requestUri = appendQueryParam(deliveriesEndpoint, "limit", String.valueOf(limit));
-        return send("GET", requestUri, null)
+        String payload = gson.toJson(new DeliveriesRequestPayload(limit));
+        return send("POST", deliveriesEndpoint, payload)
                 .thenApply(this::requireSuccessfulResponse)
                 .thenApply(this::parseDeliveriesResponse);
     }
@@ -99,7 +99,23 @@ final class CheckinDeliveryClient {
         if (statusCode >= 200 && statusCode < 300) {
             return response.body();
         }
+        if (statusCode == 405 && isDeliveriesRequest(response)) {
+            throw new IllegalStateException(
+                    "Checkin deliveries endpoint rejected request with 405. "
+                            + "The plugin should use POST /api/plugin/checkin/deliveries. "
+                            + "Please verify the running jar is updated. Response: "
+                            + preview(response.body())
+            );
+        }
         throw new IllegalStateException("HTTP " + statusCode + ": " + preview(response.body()));
+    }
+
+    private boolean isDeliveriesRequest(HttpResponse<String> response) {
+        if (response == null || response.request() == null || response.request().uri() == null) {
+            return false;
+        }
+        String path = response.request().uri().getPath();
+        return path != null && path.endsWith("/api/plugin/checkin/deliveries");
     }
 
     private List<Delivery> parseDeliveriesResponse(String body) {
@@ -269,4 +285,13 @@ final class CheckinDeliveryClient {
             this.message = message;
         }
     }
+
+    private static final class DeliveriesRequestPayload {
+        private final int limit;
+
+        private DeliveriesRequestPayload(int limit) {
+            this.limit = Math.max(1, limit);
+        }
+    }
 }
+

@@ -1,6 +1,9 @@
 package org.stellarvan.stellarstatssync;
 
 import com.google.gson.Gson;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.serializer.gson.GsonComponentSerializer;
+import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Bukkit;
 import org.bukkit.configuration.ConfigurationSection;
@@ -63,8 +66,10 @@ public class WebSocketSyncManager {
     private static final long MINIMOTD_CACHE_TTL_MILLIS = 30_000L;
     private static final long MINIMOTD_WARN_INTERVAL_MILLIS = 60_000L;
     private static final PlainTextComponentSerializer PLAIN_TEXT_SERIALIZER = PlainTextComponentSerializer.plainText();
+    private static final LegacyComponentSerializer LEGACY_COMPONENT_SERIALIZER = LegacyComponentSerializer.legacySection();
+    private static final GsonComponentSerializer GSON_COMPONENT_SERIALIZER = GsonComponentSerializer.gson();
     private static final Pattern MINI_MESSAGE_TAG_PATTERN = Pattern.compile("<[^>]*>");
-    private static final Pattern LEGACY_SECTION_COLOR_PATTERN = Pattern.compile("(?i)§[0-9A-FK-ORX]");
+    private static final Pattern LEGACY_SECTION_COLOR_PATTERN = Pattern.compile("(?i)\\u00A7[0-9A-FK-ORX]");
     private static final Pattern LEGACY_AMPERSAND_COLOR_PATTERN = Pattern.compile("(?i)&[0-9A-FK-ORX]");
     private static final Pattern MULTI_SPACE_PATTERN = Pattern.compile("\\s{2,}");
 
@@ -615,6 +620,16 @@ public class WebSocketSyncManager {
         Map<String, Object> motdObject = new LinkedHashMap<>();
         motdObject.put("source", motdSource);
         motdObject.put("clean", motdClean);
+        motdObject.put("format", asStringValue(motdPayload.get("format")));
+        motdObject.put("plain", asStringValue(motdPayload.get("plain")));
+        motdObject.put("miniMessage", asStringValue(motdPayload.get("miniMessage")));
+        motdObject.put("html", asStringValue(motdPayload.get("html")));
+        Object linesPayload = motdPayload.get("lines");
+        motdObject.put("lines", linesPayload instanceof List<?> ? linesPayload : List.of());
+        String componentJson = asStringValue(motdPayload.get("componentJson"));
+        if (!componentJson.isBlank()) {
+            motdObject.put("componentJson", componentJson);
+        }
         serverInfo.put("motdObject", motdObject);
         String worldName = "";
         if (!Bukkit.getWorlds().isEmpty() && Bukkit.getWorlds().getFirst() != null) {
@@ -663,50 +678,88 @@ public class WebSocketSyncManager {
         String sourceMode = resolveMotdSourceMode(motdConfig);
 
         if ("bukkit".equals(sourceMode)) {
-            return buildMotdPayload("bukkit", resolveBukkitMotdMiniMessage(onlinePlayers, maxPlayers), "");
+            return buildBukkitMotdPayload(onlinePlayers, maxPlayers);
         }
 
         if ("config".equals(sourceMode)) {
             if (!configuredPlain.isBlank() || !configuredMiniMessage.isBlank()) {
-                return buildMotdPayload("config", configuredPlain, configuredMiniMessage);
+                return buildMotdPayload("config", configuredPlain, configuredMiniMessage, "");
             }
-            return buildMotdPayload("bukkit", resolveBukkitMotdMiniMessage(onlinePlayers, maxPlayers), "");
+            return buildBukkitMotdPayload(onlinePlayers, maxPlayers);
         }
 
         if ("minimotd".equals(sourceMode)) {
             String miniMotdText = applyMotdPlaceholders(resolveMiniMotdMiniMessage(motdConfig), onlinePlayers, maxPlayers);
             if (!miniMotdText.isBlank()) {
-                return buildMotdPayload("minimotd", "", miniMotdText);
+                return buildMotdPayload("minimotd", "", miniMotdText, "");
             }
-            return buildMotdPayload("bukkit", resolveBukkitMotdMiniMessage(onlinePlayers, maxPlayers), "");
+            return buildBukkitMotdPayload(onlinePlayers, maxPlayers);
         }
 
         if (!configuredPlain.isBlank() || !configuredMiniMessage.isBlank()) {
-            return buildMotdPayload("config", configuredPlain, configuredMiniMessage);
+            return buildMotdPayload("config", configuredPlain, configuredMiniMessage, "");
         }
 
         String miniMotdText = applyMotdPlaceholders(resolveMiniMotdMiniMessage(motdConfig), onlinePlayers, maxPlayers);
         if (!miniMotdText.isBlank()) {
-            return buildMotdPayload("minimotd", "", miniMotdText);
+            return buildMotdPayload("minimotd", "", miniMotdText, "");
         }
-        return buildMotdPayload("bukkit", resolveBukkitMotdMiniMessage(onlinePlayers, maxPlayers), "");
+        return buildBukkitMotdPayload(onlinePlayers, maxPlayers);
     }
 
-    private Map<String, Object> buildMotdPayload(String source, String plainCandidate, String miniMessageCandidate) {
+    private Map<String, Object> buildBukkitMotdPayload(int onlinePlayers, int maxPlayers) {
+        Component motdComponent = Bukkit.motd();
+        String plainText = "";
+        String legacyText = "";
+        String componentJson = "";
+
+        if (motdComponent != null) {
+            plainText = PLAIN_TEXT_SERIALIZER.serialize(motdComponent);
+            legacyText = LEGACY_COMPONENT_SERIALIZER.serialize(motdComponent);
+            try {
+                componentJson = GSON_COMPONENT_SERIALIZER.serialize(motdComponent);
+            } catch (Exception ignored) {
+            }
+        }
+
+        plainText = applyMotdPlaceholders(plainText, onlinePlayers, maxPlayers);
+        legacyText = applyMotdPlaceholders(legacyText, onlinePlayers, maxPlayers);
+        String preferred = !legacyText.isBlank() ? legacyText : plainText;
+        return buildMotdPayload("bukkit", preferred, "", componentJson);
+    }
+
+    private Map<String, Object> buildMotdPayload(
+            String source,
+            String plainCandidate,
+            String miniMessageCandidate,
+            String componentJsonCandidate
+    ) {
         String safeSource = source == null || source.isBlank() ? "bukkit" : source;
         String safePlainCandidate = plainCandidate == null ? "" : plainCandidate.trim();
         String safeMiniMessage = miniMessageCandidate == null ? "" : miniMessageCandidate.trim();
+        String safeComponentJson = componentJsonCandidate == null ? "" : componentJsonCandidate.trim();
+        String format = resolveMotdFormat(safePlainCandidate, safeMiniMessage);
+        String reportedMiniMessage = safeMiniMessage;
+        if (reportedMiniMessage.isBlank() && "legacy".equals(format)) {
+            reportedMiniMessage = safePlainCandidate;
+        }
 
         String cleanPlain = !safePlainCandidate.isBlank()
                 ? stripMiniMessageToPlain(safePlainCandidate)
                 : stripMiniMessageToPlain(safeMiniMessage);
+        List<Map<String, Object>> lines = buildMotdLines(safePlainCandidate, reportedMiniMessage, format);
 
         Map<String, Object> motdPayload = new LinkedHashMap<>();
         motdPayload.put("source", safeSource);
+        motdPayload.put("format", format);
         motdPayload.put("clean", cleanPlain);
         motdPayload.put("plain", cleanPlain);
-        motdPayload.put("miniMessage", safeMiniMessage);
+        motdPayload.put("miniMessage", reportedMiniMessage);
+        motdPayload.put("lines", lines);
         motdPayload.put("html", "");
+        if (!safeComponentJson.isBlank()) {
+            motdPayload.put("componentJson", safeComponentJson);
+        }
         return motdPayload;
     }
 
@@ -722,12 +775,65 @@ public class WebSocketSyncManager {
         };
     }
 
-    private String resolveBukkitMotdMiniMessage(int onlinePlayers, int maxPlayers) {
-        String motd = PLAIN_TEXT_SERIALIZER.serialize(Bukkit.motd());
-        if (motd == null || motd.isBlank()) {
-            return "";
+    private String resolveMotdFormat(String plainCandidate, String miniMessageCandidate) {
+        if (miniMessageCandidate != null && !miniMessageCandidate.isBlank()) {
+            return "minimessage";
         }
-        return applyMotdPlaceholders(motd, onlinePlayers, maxPlayers);
+        if (plainCandidate != null && containsLegacyColorCode(plainCandidate)) {
+            return "legacy";
+        }
+        return "plain";
+    }
+
+    private boolean containsLegacyColorCode(String input) {
+        if (input == null || input.isBlank()) {
+            return false;
+        }
+        return LEGACY_SECTION_COLOR_PATTERN.matcher(input).find()
+                || LEGACY_AMPERSAND_COLOR_PATTERN.matcher(input).find();
+    }
+
+    private List<Map<String, Object>> buildMotdLines(String plainCandidate, String miniMessageCandidate, String format) {
+        String source = "minimessage".equals(format) ? miniMessageCandidate : plainCandidate;
+        if (source == null || source.isBlank()) {
+            source = miniMessageCandidate == null ? "" : miniMessageCandidate;
+        }
+
+        List<String> rawLines = splitMotdLines(source);
+        List<Map<String, Object>> lines = new ArrayList<>(rawLines.size());
+        for (String rawLine : rawLines) {
+            Map<String, Object> line = new LinkedHashMap<>();
+            line.put("clean", stripMiniMessageToPlain(rawLine));
+            line.put("miniMessage", rawLine);
+            lines.add(line);
+        }
+        return lines;
+    }
+
+    private List<String> splitMotdLines(String input) {
+        if (input == null || input.isBlank()) {
+            return List.of();
+        }
+        String normalized = input.replace("\r\n", "\n").replace('\r', '\n').trim();
+        if (normalized.isBlank()) {
+            return List.of();
+        }
+
+        String[] parts = normalized.split("\n", -1);
+        List<String> lines = new ArrayList<>(2);
+        for (String part : parts) {
+            if (lines.size() >= 2) {
+                break;
+            }
+            if (part == null) {
+                continue;
+            }
+            String trimmed = part.trim();
+            if (!trimmed.isBlank()) {
+                lines.add(trimmed);
+            }
+        }
+        return lines;
     }
 
     private String resolveConfiguredMotdPlain(ConfigurationSection motdConfig) {
@@ -831,7 +937,13 @@ public class WebSocketSyncManager {
                 if (!parsed.isBlank()) {
                     return parsed;
                 }
-            } catch (Exception ignored) {
+            } catch (Exception ex) {
+                logMiniMotdWarnWithRateLimit(
+                        "Failed to read MiniMOTD config from "
+                                + candidatePath
+                                + ", falling back to Bukkit MOTD."
+                );
+                logDebug("MiniMOTD read exception: " + ex.getMessage());
             }
         }
         return "";
@@ -1881,3 +1993,4 @@ public class WebSocketSyncManager {
         }
     }
 }
+
