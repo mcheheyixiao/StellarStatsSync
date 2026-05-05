@@ -37,10 +37,13 @@ final class CheckinRewardPoller {
     private final int batchSize;
     private final long pollIntervalTicks;
     private final CheckinDeliveryClient client;
+    private final String maskedApiBase;
     private final String disabledReason;
 
     private volatile BukkitTask pollTask;
     private volatile long lastFetchWarnAt = 0L;
+    private volatile long lastPollAt = 0L;
+    private volatile String lastError = "";
 
     CheckinRewardPoller(StellarStatsSync plugin) {
         this.plugin = plugin;
@@ -53,6 +56,7 @@ final class CheckinRewardPoller {
             this.batchSize = 20;
             this.pollIntervalTicks = 15L * TICKS_PER_SECOND;
             this.client = null;
+            this.maskedApiBase = "-";
             this.disabledReason = "missing checkin config section";
             return;
         }
@@ -64,6 +68,7 @@ final class CheckinRewardPoller {
             this.batchSize = clampBatchSize(checkin.getInt("batch-size", 20));
             this.pollIntervalTicks = clampPollIntervalSeconds(checkin.getInt("poll-interval-seconds", 15)) * TICKS_PER_SECOND;
             this.client = null;
+            this.maskedApiBase = maskForDoctor(resolveBaseUrl(plugin.getConfig(), checkin));
             this.disabledReason = "disabled by config";
             return;
         }
@@ -89,6 +94,7 @@ final class CheckinRewardPoller {
         if (isUnset(baseUrl)) {
             this.enabled = false;
             this.client = null;
+            this.maskedApiBase = "-";
             this.disabledReason = "missing checkin API base URL";
             logWarn("Checkin reward poller disabled: missing API base URL.");
             return;
@@ -98,6 +104,7 @@ final class CheckinRewardPoller {
         if (isUnset(token) || "CHANGE_ME".equalsIgnoreCase(token.trim())) {
             this.enabled = false;
             this.client = null;
+            this.maskedApiBase = maskForDoctor(baseUrl);
             this.disabledReason = "missing token";
             logWarn("Checkin reward poller disabled: token is missing.");
             return;
@@ -117,6 +124,7 @@ final class CheckinRewardPoller {
         }
 
         this.client = resolvedClient;
+        this.maskedApiBase = resolvedClient != null ? resolvedClient.getMaskedBaseUrl() : maskForDoctor(baseUrl);
         this.enabled = resolvedEnabled;
         this.disabledReason = resolvedDisabledReason;
     }
@@ -148,6 +156,25 @@ final class CheckinRewardPoller {
         recentAckCache.clear();
     }
 
+    public CheckinDoctorSnapshot getDoctorSnapshot() {
+        String reason = disabledReason == null || disabledReason.isBlank()
+                ? "-"
+                : sanitizeForDoctor(disabledReason);
+        String error = sanitizeForDoctor(lastError);
+        return new CheckinDoctorSnapshot(
+                enabled,
+                started.get(),
+                pollRunning.get(),
+                processingIds.size(),
+                recentAckCache.size(),
+                maskedApiBase,
+                reason,
+                lastPollAt,
+                lastFetchWarnAt,
+                error
+        );
+    }
+
     private void pollOnce() {
         if (!enabled || !started.get() || plugin.isShuttingDown()) {
             return;
@@ -156,6 +183,7 @@ final class CheckinRewardPoller {
             logDebug("Previous checkin poll is still running, skipping this tick.");
             return;
         }
+        lastPollAt = System.currentTimeMillis();
 
         cleanupExpiredAckCache();
         client.fetchPendingDeliveries(batchSize).whenComplete((deliveries, throwable) -> {
@@ -164,9 +192,12 @@ final class CheckinRewardPoller {
                 return;
             }
             if (throwable != null) {
+                lastError = sanitizeForDoctor(summarize(throwable));
                 logFetchFailure(throwable);
                 return;
             }
+            lastPollAt = System.currentTimeMillis();
+            lastError = "";
             if (deliveries == null || deliveries.isEmpty()) {
                 logDebug("No pending checkin deliveries.");
                 return;
@@ -422,6 +453,31 @@ final class CheckinRewardPoller {
         return message.trim();
     }
 
+    private static String sanitizeForDoctor(String value) {
+        if (value == null || value.isBlank()) {
+            return "-";
+        }
+        String sanitized = value.trim();
+        sanitized = sanitized.replaceAll("(?i)(password|pwd|token|auth_token)\\s*[=:]\\s*[^\\s,;]+", "$1=***");
+        sanitized = sanitized.replaceAll("(?i)(authorization\\s*:\\s*bearer\\s+)[^\\s,;]+", "$1***");
+        if (sanitized.length() > 160) {
+            sanitized = sanitized.substring(0, 160) + "...";
+        }
+        return sanitized;
+    }
+
+    private static String maskForDoctor(String value) {
+        if (value == null || value.isBlank()) {
+            return "-";
+        }
+        String masked = value.trim();
+        masked = masked.replaceAll("(?i)(token|auth_token|password)\\s*=\\s*([^&#\\s]+)", "$1=***");
+        if (masked.length() > 160) {
+            masked = masked.substring(0, 160) + "...";
+        }
+        return masked;
+    }
+
     private void logInfo(String message) {
         plugin.getLogger().info("[Checkin] " + message);
     }
@@ -446,6 +502,20 @@ final class CheckinRewardPoller {
         if (task != null) {
             task.cancel();
         }
+    }
+
+    public record CheckinDoctorSnapshot(
+            boolean enabled,
+            boolean started,
+            boolean pollRunning,
+            int processingCount,
+            int recentAckCacheSize,
+            String maskedApiBase,
+            String disabledReason,
+            long lastPollAt,
+            long lastFetchWarnAt,
+            String lastError
+    ) {
     }
 
     private record CachedAck(boolean success, String message, long createdAt) {

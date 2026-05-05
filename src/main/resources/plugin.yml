@@ -11,12 +11,12 @@ softdepend:
 commands:
   statsync:
     description: "Player stats operations and runtime status"
-    usage: "/statsync <sync|status>"
+    usage: "/statsync <sync|status|doctor>"
     permission: stellarstatsync.admin
 
 permissions:
   stellarstatsync.admin:
-    description: "Allows using /statsync sync and /statsync status"
+    description: "Allows using /statsync sync, /statsync status and /statsync doctor"
     default: op
   stellarstats.admin:
     description: "Legacy alias of stellarstatsync.admin"

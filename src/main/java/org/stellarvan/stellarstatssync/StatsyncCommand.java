@@ -16,12 +16,23 @@ public class StatsyncCommand implements CommandExecutor {
 
     private final StellarStatsSync plugin;
     private final SyncTask syncTask;
+    private final DatabaseManager databaseManager;
     private final WebSocketSyncManager webSocketSyncManager;
+    private final CheckinRewardPoller checkinRewardPoller;
+    private volatile long lastManualSyncAt = 0L;
 
-    public StatsyncCommand(StellarStatsSync plugin, SyncTask syncTask, WebSocketSyncManager webSocketSyncManager) {
+    public StatsyncCommand(
+            StellarStatsSync plugin,
+            SyncTask syncTask,
+            DatabaseManager databaseManager,
+            WebSocketSyncManager webSocketSyncManager,
+            CheckinRewardPoller checkinRewardPoller
+    ) {
         this.plugin = plugin;
         this.syncTask = syncTask;
+        this.databaseManager = databaseManager;
         this.webSocketSyncManager = webSocketSyncManager;
+        this.checkinRewardPoller = checkinRewardPoller;
     }
 
     @Override
@@ -44,6 +55,10 @@ public class StatsyncCommand implements CommandExecutor {
             }
             case "status" -> {
                 handleStatus(sender);
+                yield true;
+            }
+            case "doctor" -> {
+                handleDoctor(sender);
                 yield true;
             }
             default -> {
@@ -72,6 +87,7 @@ public class StatsyncCommand implements CommandExecutor {
                 return;
             }
 
+            lastManualSyncAt = System.currentTimeMillis();
             sender.sendMessage("Sync completed: online=" + result.onlinePlayers()
                     + ", snapshots=" + result.snapshots()
                     + ", matchedRegistered=" + result.matchedUsers()
@@ -132,8 +148,120 @@ public class StatsyncCommand implements CommandExecutor {
         sender.sendMessage("Players version: " + playersVersion);
     }
 
+    private void handleDoctor(CommandSender sender) {
+        if (!hasAdminPermission(sender)) {
+            sender.sendMessage("You do not have permission to run this command.");
+            return;
+        }
+
+        WebSocketSyncManager manager = this.webSocketSyncManager;
+        CheckinRewardPoller poller = this.checkinRewardPoller;
+        DatabaseManager dbManager = this.databaseManager;
+
+        sender.sendMessage("[StellarStatsSync Doctor]");
+        sender.sendMessage("Plugin: " + (plugin.isEnabled() ? "enabled" : "disabled"));
+        sender.sendMessage("Debug: " + StellarStatsSync.isDebug());
+        sender.sendMessage("Server: " + Bukkit.getName() + " " + Bukkit.getVersion());
+        sender.sendMessage("Online players: " + Bukkit.getOnlinePlayers().size() + "/" + Bukkit.getMaxPlayers());
+
+        sender.sendMessage("Database:");
+        sender.sendMessage("- configured: " + yesNo(dbManager != null));
+        sender.sendMessage("- pool: " + (dbManager != null && dbManager.isPoolAvailable() ? "available" : "unavailable"));
+        sender.sendMessage("- ping: pending");
+        sender.sendMessage("- latencyMs: unavailable");
+        sender.sendMessage("- error: -");
+
+        String webSocketState = "unavailable";
+        boolean webSocketEnabled = false;
+        boolean connected = false;
+        String endpoint = "-";
+        int queueSize = -1;
+        int pendingAck = -1;
+        long lastPongAt = 0L;
+        int reconnectFailures = -1;
+        String lastReconnectReason = "-";
+
+        if (manager != null) {
+            webSocketEnabled = manager.isEnabled();
+            connected = manager.isConnected();
+            if (!webSocketEnabled) {
+                webSocketState = "disabled";
+            } else if (connected) {
+                webSocketState = "connected";
+            } else {
+                webSocketState = "disconnected";
+            }
+            endpoint = manager.getMaskedEndpoint();
+            queueSize = manager.getQueueSize();
+            pendingAck = manager.getPendingAckSize();
+            lastPongAt = manager.getLastPongAt();
+            reconnectFailures = manager.getReconnectFailures();
+            lastReconnectReason = manager.getLastReconnectReason();
+        }
+
+        sender.sendMessage("WebSocket:");
+        sender.sendMessage("- enabled: " + webSocketEnabled);
+        sender.sendMessage("- connected: " + connected);
+        sender.sendMessage("- endpoint: " + safeValue(endpoint));
+        sender.sendMessage("- queueSize: " + formatCount(queueSize));
+        sender.sendMessage("- pendingAck: " + formatCount(pendingAck));
+        sender.sendMessage("- lastPong: " + formatDurationAgo(lastPongAt));
+        sender.sendMessage("- reconnectFailures: " + formatCount(reconnectFailures));
+        sender.sendMessage("- lastReconnectReason: " + sanitizeError(safeValue(lastReconnectReason)));
+        sender.sendMessage("- state: " + webSocketState);
+
+        CheckinRewardPoller.CheckinDoctorSnapshot checkinSnapshot =
+                poller == null ? null : poller.getDoctorSnapshot();
+        sender.sendMessage("Checkin:");
+        sender.sendMessage("- enabled: " + (checkinSnapshot != null && checkinSnapshot.enabled()));
+        sender.sendMessage("- running: " + (checkinSnapshot != null && checkinSnapshot.started()));
+        sender.sendMessage("- apiBase: " + (checkinSnapshot == null ? "unavailable" : safeValue(checkinSnapshot.maskedApiBase())));
+        sender.sendMessage("- lastPoll: " + (checkinSnapshot == null ? "unavailable" : formatDurationAgo(checkinSnapshot.lastPollAt())));
+        sender.sendMessage("- lastError: " + (checkinSnapshot == null ? "unavailable" : sanitizeError(checkinSnapshot.lastError())));
+        sender.sendMessage("- processing: " + (checkinSnapshot == null ? "unavailable" : checkinSnapshot.processingCount()));
+        sender.sendMessage("- recentAckCache: " + (checkinSnapshot == null ? "unavailable" : checkinSnapshot.recentAckCacheSize()));
+        sender.sendMessage("- pollRunning: " + (checkinSnapshot != null && checkinSnapshot.pollRunning()));
+        if (checkinSnapshot != null && !checkinSnapshot.enabled()) {
+            sender.sendMessage("- disabledReason: " + sanitizeError(checkinSnapshot.disabledReason()));
+        }
+
+        sender.sendMessage("Sync:");
+        sender.sendMessage("- intervalTicks: " + plugin.getConfig().getLong("sync_interval_ticks", 12000L));
+        sender.sendMessage("- lastManualSync: " + (lastManualSyncAt <= 0L ? "unknown" : formatDurationAgo(lastManualSyncAt)));
+
+        if (dbManager == null) {
+            sender.sendMessage("[StellarStatsSync Doctor][Database]");
+            sender.sendMessage("- ping: unavailable");
+            sender.sendMessage("- latencyMs: unavailable");
+            sender.sendMessage("- error: unavailable");
+            return;
+        }
+
+        dbManager.checkHealthAsync().whenComplete((health, throwable) -> Bukkit.getScheduler().runTask(plugin, () -> {
+            sender.sendMessage("[StellarStatsSync Doctor][Database]");
+
+            if (throwable != null) {
+                sender.sendMessage("- ping: FAIL");
+                sender.sendMessage("- latencyMs: unavailable");
+                sender.sendMessage("- error: " + sanitizeError(throwable.getMessage()));
+                return;
+            }
+
+            if (health == null) {
+                sender.sendMessage("- ping: FAIL");
+                sender.sendMessage("- latencyMs: unavailable");
+                sender.sendMessage("- error: unavailable");
+                return;
+            }
+
+            sender.sendMessage("- ping: " + (health.ok() ? "OK" : "FAIL"));
+            sender.sendMessage("- latencyMs: " + (health.latencyMs() >= 0L ? Long.toString(health.latencyMs()) : "unavailable"));
+            sender.sendMessage("- error: " + (health.ok() ? "-" : sanitizeError(health.error())));
+        }));
+    }
+
     private void sendUsage(CommandSender sender, String label) {
-        sender.sendMessage("Usage: /" + label + " <sync|status>");
+        sender.sendMessage("Usage: /" + label + " <sync|status|doctor>");
     }
 
     private boolean hasAdminPermission(CommandSender sender) {
@@ -162,5 +290,31 @@ public class StatsyncCommand implements CommandExecutor {
         }
         long hours = minutes / 60L;
         return hours + "h";
+    }
+
+    private String yesNo(boolean value) {
+        return value ? "yes" : "no";
+    }
+
+    private String formatCount(int value) {
+        return value < 0 ? "unavailable" : Integer.toString(value);
+    }
+
+    private String safeValue(String value) {
+        return value == null || value.isBlank() ? "-" : value;
+    }
+
+    private String sanitizeError(String value) {
+        if (value == null || value.isBlank()) {
+            return "-";
+        }
+        String sanitized = value.trim();
+        sanitized = sanitized.replaceAll("(?i)(password|pwd|token|auth_token)\\s*[=:]\\s*[^\\s,;]+", "$1=***");
+        sanitized = sanitized.replaceAll("(?i)(authorization\\s*:\\s*bearer\\s+)[^\\s,;]+", "$1***");
+        sanitized = sanitized.replaceAll("(?i)jdbc:mysql://[^\\s,;]+", "jdbc:mysql://***");
+        if (sanitized.length() > 160) {
+            sanitized = sanitized.substring(0, 160) + "...";
+        }
+        return sanitized;
     }
 }

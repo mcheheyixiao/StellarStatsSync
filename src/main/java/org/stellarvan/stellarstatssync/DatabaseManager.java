@@ -12,6 +12,7 @@ import java.sql.SQLException;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 
 public class DatabaseManager {
@@ -54,6 +55,42 @@ public class DatabaseManager {
         if (dataSource != null && !dataSource.isClosed()) {
             dataSource.close();
         }
+    }
+
+    public boolean isPoolAvailable() {
+        return dataSource != null && !dataSource.isClosed();
+    }
+
+    public CompletableFuture<DatabaseHealth> checkHealthAsync() {
+        if (!plugin.isEnabled()) {
+            return CompletableFuture.completedFuture(new DatabaseHealth(false, -1L, "plugin disabled"));
+        }
+        if (plugin instanceof StellarStatsSync stellarStatsSync && stellarStatsSync.isShuttingDown()) {
+            return CompletableFuture.completedFuture(new DatabaseHealth(false, -1L, "plugin shutting down"));
+        }
+        if (!isPoolAvailable()) {
+            return CompletableFuture.completedFuture(new DatabaseHealth(false, -1L, "pool unavailable"));
+        }
+
+        CompletableFuture<DatabaseHealth> future = new CompletableFuture<>();
+        try {
+            Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+                long startedAtNanos = System.nanoTime();
+                try (Connection connection = dataSource.getConnection();
+                     PreparedStatement stmt = connection.prepareStatement("SELECT 1");
+                     ResultSet rs = stmt.executeQuery()) {
+                    boolean ok = rs.next();
+                    long latencyMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos);
+                    future.complete(new DatabaseHealth(ok, latencyMs, ok ? "-" : "empty result"));
+                } catch (Exception ex) {
+                    long latencyMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos);
+                    future.complete(new DatabaseHealth(false, latencyMs, sanitizeError(ex.getMessage())));
+                }
+            });
+        } catch (Exception ex) {
+            future.complete(new DatabaseHealth(false, -1L, sanitizeError(ex.getMessage())));
+        }
+        return future;
     }
 
     @SuppressWarnings("unused")
@@ -183,6 +220,23 @@ public class DatabaseManager {
         }
     }
 
+    private static String sanitizeError(String value) {
+        if (value == null || value.isBlank()) {
+            return "-";
+        }
+        String sanitized = value.trim();
+        sanitized = sanitized.replaceAll("(?i)(password|pwd|token|auth_token)\\s*[=:]\\s*[^\\s,;]+", "$1=***");
+        sanitized = sanitized.replaceAll("(?i)(authorization\\s*:\\s*bearer\\s+)[^\\s,;]+", "$1***");
+        sanitized = sanitized.replaceAll("(?i)jdbc:mysql://[^\\s,;]+", "jdbc:mysql://***");
+        if (sanitized.length() > 160) {
+            sanitized = sanitized.substring(0, 160) + "...";
+        }
+        return sanitized;
+    }
+
     public record DbSyncResult(int batchSize, int matchedUsers, long totalAffectedRows) {
+    }
+
+    public record DatabaseHealth(boolean ok, long latencyMs, String error) {
     }
 }

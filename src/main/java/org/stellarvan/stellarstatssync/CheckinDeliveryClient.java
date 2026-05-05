@@ -25,6 +25,7 @@ final class CheckinDeliveryClient {
     private final Gson gson;
     private final URI deliveriesEndpoint;
     private final URI acknowledgeEndpoint;
+    private final String maskedBaseUrl;
     private final String token;
     private final Duration requestTimeout;
 
@@ -32,12 +33,17 @@ final class CheckinDeliveryClient {
         String normalizedBaseUrl = normalizeBaseUrl(baseUrl);
         this.deliveriesEndpoint = URI.create(normalizedBaseUrl + "/api/plugin/checkin/deliveries");
         this.acknowledgeEndpoint = URI.create(normalizedBaseUrl + "/api/plugin/checkin/deliveries/ack");
+        this.maskedBaseUrl = maskSensitive(normalizedBaseUrl);
         this.token = token == null ? "" : token.trim();
         this.requestTimeout = Duration.ofSeconds(Math.max(1, requestTimeoutSeconds));
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(this.requestTimeout)
                 .build();
         this.gson = new Gson();
+    }
+
+    public String getMaskedBaseUrl() {
+        return maskedBaseUrl;
     }
 
     public CompletableFuture<List<Delivery>> fetchPendingDeliveries(int limit) {
@@ -239,6 +245,16 @@ final class CheckinDeliveryClient {
             return normalized;
         }
         return normalized.substring(0, RESPONSE_PREVIEW_LIMIT) + "...";
+    }
+
+    private static String maskSensitive(String value) {
+        if (value == null || value.isBlank()) {
+            return "-";
+        }
+        String masked = value.trim();
+        masked = masked.replaceAll("(?i)(token|auth_token|password)\\s*=\\s*([^&#\\s]+)", "$1=***");
+        masked = masked.replaceAll("(?i)(authorization\\s*:\\s*bearer\\s+)([^\\s]+)", "$1***");
+        return masked;
     }
 
     public record Delivery(long id, String username, String mcUuid, Reward reward) {
