@@ -2283,7 +2283,7 @@ public class WebSocketSyncManager {
             if (bridge == null) {
                 Map<String, Object> result = new LinkedHashMap<>();
                 result.put("ok", false);
-                result.put("status", "litesignin_bridge_unavailable");
+                result.put("status", "bridge_disabled");
                 result.put("message", "LiteSignIn bridge is not available.");
                 sendCustomEnvelope(
                         TYPE_SIGNIN_RESULT,
