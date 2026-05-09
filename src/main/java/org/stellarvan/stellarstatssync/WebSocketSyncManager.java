@@ -2279,10 +2279,11 @@ public class WebSocketSyncManager {
 
         if (TYPE_SIGNIN_REQUEST.equalsIgnoreCase(messageType)) {
             LiteSignInBridge bridge = this.liteSignInBridge;
+            String requestId = asNonBlankString(envelope.get("requestId"));
             if (bridge == null) {
                 Map<String, Object> result = new LinkedHashMap<>();
                 result.put("ok", false);
-                result.put("status", "bridge_unavailable");
+                result.put("status", "litesignin_bridge_unavailable");
                 result.put("message", "LiteSignIn bridge is not available.");
                 sendCustomEnvelope(
                         TYPE_SIGNIN_RESULT,
@@ -2290,16 +2291,33 @@ public class WebSocketSyncManager {
                         4100,
                         "LiteSignIn bridge is not available.",
                         result,
-                        asNonBlankString(envelope.get("requestId"))
+                        requestId
                 );
                 return;
             }
 
-            Object requestPayload = envelope.get("payload");
+            Object requestPayload = envelope.get("data");
             if (!(requestPayload instanceof Map<?, ?>)) {
-                requestPayload = envelope.get("data");
+                requestPayload = envelope.get("payload");
             }
-            bridge.handleSignInRequest(asNonBlankString(envelope.get("requestId")), requestPayload);
+            try {
+                bridge.handleSignInRequest(requestId, requestPayload);
+            } catch (Exception ex) {
+                logWarn("Failed to dispatch signin.request: " + sanitizeConfigError(ex.getMessage()));
+                logVerboseThrowable(ex);
+                Map<String, Object> result = new LinkedHashMap<>();
+                result.put("ok", false);
+                result.put("status", "litesignin_api_failed");
+                result.put("message", "Failed to dispatch sign-in request.");
+                sendCustomEnvelope(
+                        TYPE_SIGNIN_RESULT,
+                        false,
+                        4500,
+                        "Failed to dispatch sign-in request.",
+                        result,
+                        requestId
+                );
+            }
             return;
         }
 

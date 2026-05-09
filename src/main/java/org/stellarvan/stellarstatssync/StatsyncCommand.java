@@ -246,14 +246,14 @@ public class StatsyncCommand implements CommandExecutor {
         LiteSignInBridge.SignInDoctorSnapshot signInSnapshot =
                 bridge == null ? null : bridge.getDoctorSnapshot();
         sender.sendMessage("SignIn:");
-        sender.sendMessage("- enabled: " + (signInSnapshot != null && signInSnapshot.enabled()));
+        sender.sendMessage("- bridgeEnabled: " + (signInSnapshot != null && signInSnapshot.enabled()));
         sender.sendMessage("- provider: " + (signInSnapshot == null ? "unavailable" : safeValue(signInSnapshot.provider())));
-        sender.sendMessage("- providerAvailable: " + (signInSnapshot != null && signInSnapshot.providerAvailable()));
-        sender.sendMessage("- providerEnabled: " + (signInSnapshot != null && signInSnapshot.providerEnabled()));
+        sender.sendMessage("- liteSignInInstalled: " + (signInSnapshot != null && signInSnapshot.providerAvailable()));
+        sender.sendMessage("- liteSignInEnabled: " + (signInSnapshot != null && signInSnapshot.providerEnabled()));
         sender.sendMessage("- eventListening: " + (signInSnapshot != null && signInSnapshot.eventListening()));
         sender.sendMessage("- requirePlayerOnline: " + (signInSnapshot != null && signInSnapshot.requirePlayerOnline()));
         sender.sendMessage("- sendGameUpdates: " + (signInSnapshot != null && signInSnapshot.sendGameSignInUpdates()));
-        sender.sendMessage("- requestContexts: " + (signInSnapshot == null ? "unavailable" : signInSnapshot.requestContextSize()));
+        sender.sendMessage("- requestContextSize: " + (signInSnapshot == null ? "unavailable" : signInSnapshot.requestContextSize()));
         if (signInSnapshot != null && signInSnapshot.disabledReason() != null && !signInSnapshot.disabledReason().isBlank() && !"-".equals(signInSnapshot.disabledReason())) {
             sender.sendMessage("- disabledReason: " + sanitizeError(signInSnapshot.disabledReason()));
         }
