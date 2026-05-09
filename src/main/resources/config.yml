@@ -40,15 +40,45 @@ websocket:
   queue_limit: 1024
   connect_timeout_seconds: 10
 
-checkin:
+status:
   enabled: true
-  api-base-url: "https://www.stellarvan.cn"
-  token: "CHANGE_ME"
-  poll-interval-seconds: 15
-  batch-size: 20
-  command-dispatcher: "console"
-  retry-failed: true
-  request-timeout-seconds: 8
+  interval-seconds: 5
+
+  # Privacy: if true, website/WebSocket center can receive current online player names.
+  expose-player-list: true
+  # Privacy: if true, each public player entry includes UUID.
+  include-player-uuid: true
+
+  include-motd: true
+  include-tps: true
+
+  # Optional status token. If blank, plugin falls back to websocket.auth_token and other legacy keys.
+  token: ""
+
+  server-id: "survival"
+  server-name: "繁星World"
+  public-host: "mc.stellarvan.cn"
+  # Public display port can differ from Bukkit listening port (SRV / reverse proxy / port mapping).
+  public-port: 25565
+
+  # Fallback values are used only when Bukkit API read fails.
+  fallback-online-players: 0
+  fallback-max-players: 0
+
+  http:
+    # Optional website API push. Leave disabled when only using WebSocket status center.
+    enabled: false
+    # Example: https://www.stellarvan.cn/api/server/status/update
+    endpoint: ""
+    request-timeout-seconds: 8
+
+signin:
+  enabled: true
+  provider: "LiteSignIn"
+  require_player_online: true
+  listen_litesignin_events: true
+  send_game_signin_updates: true
+  request_context_ttl_seconds: 15
   debug: false
 
 realtime:

@@ -3,6 +3,7 @@ package org.stellarvan.stellarstatssync;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.command.PluginCommand;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.stellarvan.stellarstatssync.bridge.litesignin.LiteSignInBridge;
 
 import java.util.logging.Level;
 
@@ -14,7 +15,7 @@ public class StellarStatsSync extends JavaPlugin {
     private DatabaseManager databaseManager;
     private SyncTask syncTask;
     private WebSocketSyncManager webSocketSyncManager;
-    private CheckinRewardPoller checkinRewardPoller;
+    private LiteSignInBridge liteSignInBridge;
 
     public static boolean isDebug() {
         return DEBUG;
@@ -43,18 +44,26 @@ public class StellarStatsSync extends JavaPlugin {
 
         getServer().getPluginManager().registerEvents(new PlayerQuitListener(this, syncTask, databaseManager), this);
         this.webSocketSyncManager = new WebSocketSyncManager(this);
-        this.checkinRewardPoller = new CheckinRewardPoller(this);
+        this.liteSignInBridge = new LiteSignInBridge(this, webSocketSyncManager);
+        this.webSocketSyncManager.setLiteSignInBridge(liteSignInBridge);
 
-        if (webSocketSyncManager.isEnabled()) {
+        if (webSocketSyncManager.shouldStart()) {
             webSocketSyncManager.start();
             getServer().getPluginManager().registerEvents(new RealtimeSyncListener(this, webSocketSyncManager), this);
             getServer().getPluginManager().registerEvents(new PluginStatusListener(this, webSocketSyncManager), this);
-            getLogger().info("WebSocket realtime sync enabled.");
+            if (webSocketSyncManager.isEnabled()) {
+                getLogger().info("WebSocket realtime sync enabled.");
+            } else {
+                getLogger().info("WebSocket realtime sync disabled by config.");
+            }
+            if (webSocketSyncManager.isStatusHttpEnabled()) {
+                getLogger().info("HTTP status sync enabled.");
+            }
         } else {
-            getLogger().info("WebSocket realtime sync disabled by config.");
+            getLogger().info("Realtime status sync disabled by config.");
         }
 
-        checkinRewardPoller.start();
+        liteSignInBridge.start();
 
         PluginCommand statsyncCommand = getCommand("statsync");
         if (statsyncCommand != null) {
@@ -63,7 +72,7 @@ public class StellarStatsSync extends JavaPlugin {
                     syncTask,
                     databaseManager,
                     webSocketSyncManager,
-                    checkinRewardPoller
+                    liteSignInBridge
             ));
         } else {
             getLogger().warning("Command 'statsync' not found in plugin.yml");
@@ -75,11 +84,11 @@ public class StellarStatsSync extends JavaPlugin {
     @Override
     public void onDisable() {
         this.isShuttingDown = true;
+        if (liteSignInBridge != null) {
+            liteSignInBridge.shutdown();
+        }
         if (webSocketSyncManager != null) {
             webSocketSyncManager.shutdown();
-        }
-        if (checkinRewardPoller != null) {
-            checkinRewardPoller.shutdown();
         }
         if (syncTask != null) {
             syncTask.performSyncSyncOnDisable();

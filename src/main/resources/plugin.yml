@@ -7,6 +7,7 @@ description: "Asynchronously syncs player statistics to a remote MySQL database 
 load: POSTWORLD
 softdepend:
   - MiniMOTD
+  - LiteSignIn
 
 commands:
   statsync:

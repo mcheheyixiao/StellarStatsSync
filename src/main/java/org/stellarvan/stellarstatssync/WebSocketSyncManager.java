@@ -7,9 +7,11 @@ import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Bukkit;
 import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.scheduler.BukkitTask;
+import org.stellarvan.stellarstatssync.bridge.litesignin.LiteSignInBridge;
 import org.stellarvan.stellarstatssync.websocket.dto.MessageEnvelope;
 
 import java.lang.management.ManagementFactory;
@@ -17,6 +19,8 @@ import java.lang.reflect.Method;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.net.http.WebSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -56,6 +60,8 @@ public class WebSocketSyncManager {
     private static final String TYPE_SNAPSHOT_REQUEST = "snapshot_request";
     private static final String TYPE_SYNC_STATE = "sync_state";
     private static final String TYPE_ERROR = "error";
+    private static final String TYPE_SIGNIN_REQUEST = "signin.request";
+    private static final String TYPE_SIGNIN_RESULT = "signin.result";
     private static final int MAX_PLUGINS_PER_UPDATE = 300;
     private static final long PLUGINS_UPDATE_DEBOUNCE_TICKS = 40L;
     private static final long QUEUE_WARN_INTERVAL_MILLIS = 60_000L;
@@ -65,6 +71,9 @@ public class WebSocketSyncManager {
     private static final long MAX_MINIMOTD_CONFIG_BYTES = 128L * 1024L;
     private static final long MINIMOTD_CACHE_TTL_MILLIS = 30_000L;
     private static final long MINIMOTD_WARN_INTERVAL_MILLIS = 60_000L;
+    private static final long STATUS_FALLBACK_WARN_INTERVAL_MILLIS = 60_000L;
+    private static final long STATUS_HTTP_WARN_INTERVAL_MILLIS = 60_000L;
+    private static final int STATUS_RESPONSE_PREVIEW_LIMIT = 160;
     private static final PlainTextComponentSerializer PLAIN_TEXT_SERIALIZER = PlainTextComponentSerializer.plainText();
     private static final LegacyComponentSerializer LEGACY_COMPONENT_SERIALIZER = LegacyComponentSerializer.legacySection();
     private static final GsonComponentSerializer GSON_COMPONENT_SERIALIZER = GsonComponentSerializer.gson();
@@ -97,6 +106,21 @@ public class WebSocketSyncManager {
     private final boolean debugVerbose;
     private final int queueLimit;
     private final int connectTimeoutSeconds;
+    private final boolean statusSyncEnabled;
+    private final boolean exposePlayerList;
+    private final boolean includePlayerUuid;
+    private final boolean includeMotd;
+    private final boolean includeTps;
+    private final String statusServerId;
+    private final String statusServerName;
+    private final String publicHost;
+    private final int publicPort;
+    private final int fallbackOnlinePlayers;
+    private final int fallbackMaxPlayers;
+    private final String statusToken;
+    private final boolean statusHttpEnabled;
+    private final URI statusHttpEndpoint;
+    private final int statusHttpRequestTimeoutSeconds;
 
     private final Object queueLock = new Object();
     private final ArrayDeque<MessageEnvelope> pendingMessages = new ArrayDeque<>();
@@ -113,6 +137,7 @@ public class WebSocketSyncManager {
     private final AtomicBoolean miniMotdReloading = new AtomicBoolean(false);
 
     private volatile WebSocket webSocket;
+    private volatile LiteSignInBridge liteSignInBridge;
     private volatile boolean authDelivered;
     private volatile int lastKnownPlayersVersion = 0;
     private volatile long lastPongAt = 0L;
@@ -128,6 +153,15 @@ public class WebSocketSyncManager {
     private volatile BukkitTask reportTask;
     private volatile BukkitTask pluginsReportTask;
     private volatile BukkitTask pluginsDebounceTask;
+    private volatile long lastStatusPushAt = 0L;
+    private volatile long lastStatusResultAt = 0L;
+    private volatile String lastStatusResult = "never";
+    private volatile long lastStatusFallbackWarnAt = 0L;
+    private volatile long lastStatusHttpWarnAt = 0L;
+    private volatile String lastStatusWebSocketResult = "disabled";
+    private volatile long lastStatusWebSocketResultAt = 0L;
+    private volatile String lastStatusHttpResult = "disabled";
+    private volatile long lastStatusHttpResultAt = 0L;
 
     public WebSocketSyncManager(StellarStatsSync plugin) {
         this.plugin = plugin;
@@ -179,7 +213,63 @@ public class WebSocketSyncManager {
 
         this.reconnectIntervalTicks = Math.max(1L, reconnectSeconds) * TICKS_PER_SECOND;
         this.heartbeatIntervalTicks = Math.max(1L, heartbeatSeconds) * TICKS_PER_SECOND;
-        this.reportIntervalTicks = Math.max(5L, reportSeconds) * TICKS_PER_SECOND;
+        ConfigurationSection status = plugin.getConfig().getConfigurationSection("status");
+        this.statusSyncEnabled = status == null || status.getBoolean("enabled", true);
+        long statusReportSeconds = status != null
+                ? status.getLong("interval-seconds", reportSeconds)
+                : reportSeconds;
+        this.reportIntervalTicks = Math.max(5L, statusReportSeconds) * TICKS_PER_SECOND;
+        this.exposePlayerList = status == null || status.getBoolean("expose-player-list", true);
+        this.includePlayerUuid = status == null || status.getBoolean("include-player-uuid", true);
+        this.includeMotd = status == null || status.getBoolean("include-motd", true);
+        this.includeTps = status == null || status.getBoolean("include-tps", true);
+        String statusServerIdRaw = status != null ? status.getString("server-id", this.serverId) : this.serverId;
+        this.statusServerId = statusServerIdRaw == null || statusServerIdRaw.isBlank()
+                ? this.serverId
+                : statusServerIdRaw.trim();
+        String statusServerNameRaw = status != null ? status.getString("server-name", this.serverName) : this.serverName;
+        this.statusServerName = statusServerNameRaw == null || statusServerNameRaw.isBlank()
+                ? this.serverName
+                : statusServerNameRaw.trim();
+        String defaultPublicHost = resolveDefaultPublicHost(parsedEndpoint);
+        String publicHostRaw = status != null ? status.getString("public-host", defaultPublicHost) : defaultPublicHost;
+        this.publicHost = publicHostRaw == null || publicHostRaw.isBlank() ? defaultPublicHost : publicHostRaw.trim();
+        int defaultPublicPort;
+        try {
+            int bukkitPort = Bukkit.getPort();
+            defaultPublicPort = bukkitPort > 0 ? bukkitPort : 25565;
+        } catch (Exception ignored) {
+            defaultPublicPort = 25565;
+        }
+        int configuredPublicPort = status != null ? status.getInt("public-port", defaultPublicPort) : defaultPublicPort;
+        this.publicPort = configuredPublicPort > 0 ? configuredPublicPort : defaultPublicPort;
+        this.fallbackOnlinePlayers = Math.max(0, status != null ? status.getInt("fallback-online-players", 0) : 0);
+        this.fallbackMaxPlayers = Math.max(0, status != null ? status.getInt("fallback-max-players", 0) : 0);
+        this.statusToken = resolveStatusToken(status, ws, plugin.getConfig());
+        ConfigurationSection statusHttp = status != null ? status.getConfigurationSection("http") : null;
+        String statusHttpEndpointRaw = resolveStatusHttpEndpoint(status, statusHttp, plugin.getConfig());
+        URI parsedStatusHttpEndpoint = null;
+        boolean statusHttpEnabledFlag = statusHttp != null && statusHttp.getBoolean("enabled", false);
+        if (statusHttpEnabledFlag) {
+            try {
+                if (statusHttpEndpointRaw == null || statusHttpEndpointRaw.isBlank()) {
+                    throw new IllegalArgumentException("status.http.endpoint is blank");
+                }
+                parsedStatusHttpEndpoint = URI.create(statusHttpEndpointRaw.trim());
+                String httpScheme = parsedStatusHttpEndpoint.getScheme();
+                if (!"http".equalsIgnoreCase(httpScheme) && !"https".equalsIgnoreCase(httpScheme)) {
+                    throw new IllegalArgumentException("Unsupported status HTTP scheme: " + httpScheme);
+                }
+            } catch (Exception ex) {
+                statusHttpEnabledFlag = false;
+                plugin.getLogger().warning("[Status][HTTP] Disabled: " + sanitizeConfigError(ex.getMessage()));
+            }
+        }
+        this.statusHttpEnabled = statusHttpEnabledFlag;
+        this.statusHttpEndpoint = parsedStatusHttpEndpoint;
+        this.statusHttpRequestTimeoutSeconds = Math.max(1, statusHttp != null
+                ? statusHttp.getInt("request-timeout-seconds", 8)
+                : 8);
 
         this.syncChat = ws == null || ws.getBoolean("sync_chat", true);
         this.syncPlayerJoinQuit = ws == null || ws.getBoolean("sync_player_join_quit", true);
@@ -215,8 +305,49 @@ public class WebSocketSyncManager {
         return enabled;
     }
 
+    public String getServerId() {
+        return serverId;
+    }
+
+    public boolean shouldStart() {
+        return enabled || (statusSyncEnabled && statusHttpEnabled);
+    }
+
     public boolean isSyncChatEnabled() {
         return enabled && syncChat;
+    }
+
+    public boolean isStatusSyncEnabled() {
+        return statusSyncEnabled && hasStatusTransportEnabled();
+    }
+
+    public boolean isPlayerListExposed() {
+        return exposePlayerList;
+    }
+
+    public long getLastStatusPushAt() {
+        return lastStatusPushAt;
+    }
+
+    public long getLastStatusResultAt() {
+        return lastStatusResultAt;
+    }
+
+    public String getLastStatusResult() {
+        refreshLastStatusSummary();
+        String result = lastStatusResult;
+        return result == null || result.isBlank() ? "never" : result;
+    }
+
+    public boolean isStatusHttpEnabled() {
+        return statusHttpEnabled;
+    }
+
+    public String getMaskedStatusHttpEndpoint() {
+        if (!statusHttpEnabled || statusHttpEndpoint == null) {
+            return "";
+        }
+        return maskSensitiveQueryParams(statusHttpEndpoint.toString());
     }
 
     @SuppressWarnings("unused")
@@ -258,28 +389,39 @@ public class WebSocketSyncManager {
     }
 
     public String getMaskedEndpoint() {
+        if (!enabled) {
+            return "";
+        }
         return maskSensitiveQueryParams(endpoint.toString());
     }
 
+    public void setLiteSignInBridge(LiteSignInBridge liteSignInBridge) {
+        this.liteSignInBridge = liteSignInBridge;
+    }
+
     public void start() {
-        if (!enabled || !started.compareAndSet(false, true)) {
+        if (!shouldStart() || !started.compareAndSet(false, true)) {
             return;
         }
 
-        this.heartbeatTask = Bukkit.getScheduler().runTaskTimerAsynchronously(
-                plugin,
-                this::sendHeartbeat,
-                heartbeatIntervalTicks,
-                heartbeatIntervalTicks
-        );
+        if (enabled) {
+            this.heartbeatTask = Bukkit.getScheduler().runTaskTimerAsynchronously(
+                    plugin,
+                    this::sendHeartbeat,
+                    heartbeatIntervalTicks,
+                    heartbeatIntervalTicks
+            );
+        }
 
-        this.reportTask = Bukkit.getScheduler().runTaskTimer(
-                plugin,
-                this::sendStatsSnapshot,
-                reportIntervalTicks,
-                reportIntervalTicks
-        );
-        if (syncPluginStatus) {
+        if (statusSyncEnabled && hasStatusTransportEnabled()) {
+            this.reportTask = Bukkit.getScheduler().runTaskTimer(
+                    plugin,
+                    this::sendStatsSnapshot,
+                    reportIntervalTicks,
+                    reportIntervalTicks
+            );
+        }
+        if (enabled && syncPluginStatus) {
             this.pluginsReportTask = Bukkit.getScheduler().runTaskTimer(
                     plugin,
                     this::sendPluginsSnapshot,
@@ -288,11 +430,13 @@ public class WebSocketSyncManager {
             );
         }
 
-        connectAsync("initial_start");
+        if (enabled) {
+            connectAsync("initial_start");
+        }
     }
 
     public void shutdown() {
-        if (!enabled || !started.compareAndSet(true, false)) {
+        if (!started.compareAndSet(true, false)) {
             return;
         }
 
@@ -339,34 +483,41 @@ public class WebSocketSyncManager {
 
     public void sendPlayerJoin(@SuppressWarnings("unused") String playerUuid, String playerName) {
         // playerUuid reserved for future protocol fields.
-        if (!enabled || !syncPlayerJoinQuit || playerName == null) {
+        if (!enabled || playerName == null) {
             return;
         }
-        sendPlayersDelta();
+        if (syncPlayerJoinQuit) {
+            sendPlayersDelta();
+        }
+        scheduleStatusSnapshotRefresh();
     }
 
     public void sendPlayerQuit(@SuppressWarnings("unused") String playerUuid, String playerName) {
         // playerUuid reserved for future protocol fields.
-        if (!enabled || !syncPlayerJoinQuit || playerName == null) {
+        if (!enabled || playerName == null) {
             return;
         }
-        sendPlayersDelta();
+        if (syncPlayerJoinQuit) {
+            sendPlayersDelta();
+        }
+        scheduleStatusSnapshotRefresh();
     }
 
     private void sendPlayersDelta() {
         if (!enabled || !started.get()) {
             return;
         }
-
-        Collection<? extends Player> onlinePlayers = Bukkit.getOnlinePlayers();
-        Map<String, Map<String, Object>> currentPlayers = new LinkedHashMap<>(onlinePlayers.size());
-        for (Player player : onlinePlayers) {
-            Map<String, Object> playerDto = toPlayerDto(player);
-            String playerKey = resolvePlayerKey(playerDto);
-            if (playerKey != null && !playerKey.isBlank()) {
-                currentPlayers.put(playerKey, playerDto);
-            }
+        if (!Bukkit.isPrimaryThread()) {
+            Bukkit.getScheduler().runTask(plugin, this::sendPlayersDelta);
+            return;
         }
+        if (!exposePlayerList) {
+            clearTrackedPlayers();
+            return;
+        }
+
+        OnlineSnapshot onlineSnapshot = collectOnlineSnapshot();
+        Map<String, Map<String, Object>> currentPlayers = buildCurrentPlayersState(onlineSnapshot.onlinePlayers());
 
         PlayersDelta delta = computePlayersDelta(currentPlayers);
         if (delta.isEmpty()) {
@@ -377,8 +528,24 @@ public class WebSocketSyncManager {
         payload.put("add", delta.add());
         payload.put("remove", delta.remove());
         payload.put("update", delta.update());
-        payload.put("onlineCount", currentPlayers.size());
+        payload.put("onlineCount", onlineSnapshot.onlineCount());
+        payload.put("maxPlayers", onlineSnapshot.maxPlayers());
+        payload.put("list_available", onlineSnapshot.onlineCount() == 0 || !currentPlayers.isEmpty());
+        payload.put("exposed", true);
+        payload.put("playerList", buildLegacyPlayerList(new ArrayList<>(currentPlayers.values())));
+        payload.put("timestamp", System.currentTimeMillis());
         enqueueMessage(createSuccessEnvelope(TYPE_PLAYERS_DELTA, payload));
+    }
+
+    private void scheduleStatusSnapshotRefresh() {
+        if (!started.get() || !statusSyncEnabled || !hasStatusTransportEnabled()) {
+            return;
+        }
+        if (Bukkit.isPrimaryThread()) {
+            sendStatsSnapshot();
+            return;
+        }
+        Bukkit.getScheduler().runTask(plugin, this::sendStatsSnapshot);
     }
 
     public void schedulePluginsUpdateDebounced() {
@@ -500,6 +667,13 @@ public class WebSocketSyncManager {
         enqueueMessage(createSuccessEnvelope(TYPE_SERVER_STATUS, payload));
     }
 
+    public void sendCustomEnvelope(String type, boolean success, int code, String message, Object data, String requestId) {
+        if (!enabled || type == null || type.isBlank()) {
+            return;
+        }
+        enqueueMessage(createEnvelope(type, success, code, message, data, requestId));
+    }
+
     private void connectAsync(String reason) {
         if (!enabled || !started.get() || plugin.isShuttingDown()) {
             return;
@@ -566,20 +740,28 @@ public class WebSocketSyncManager {
     }
 
     private void sendStatsSnapshot() {
-        if (!enabled || !started.get()) {
+        if (!started.get() || !statusSyncEnabled || !hasStatusTransportEnabled()) {
+            return;
+        }
+        if (!Bukkit.isPrimaryThread()) {
+            Bukkit.getScheduler().runTask(plugin, this::sendStatsSnapshot);
             return;
         }
 
-        Collection<? extends Player> onlinePlayers = Bukkit.getOnlinePlayers();
-        int onlineCount = onlinePlayers.size();
-        int maxPlayers = Bukkit.getMaxPlayers();
+        OnlineSnapshot onlineSnapshot = collectOnlineSnapshot();
+        int onlineCount = onlineSnapshot.onlineCount();
+        int maxPlayers = onlineSnapshot.maxPlayers();
+        List<Player> onlinePlayers = onlineSnapshot.onlinePlayers();
 
         Map<String, Object> metrics = new LinkedHashMap<>();
         metrics.put("onlinePlayers", onlineCount);
         metrics.put("maxPlayers", maxPlayers);
 
-        List<Double> tpsValues = resolveTpsValues();
-        metrics.put("tps", tpsValues.isEmpty() ? 0.0D : tpsValues.getFirst());
+        Double primaryTps = includeTps ? resolvePrimaryTps() : null;
+        if (includeTps && primaryTps == null) {
+            logDebug("TPS unavailable, reporting null in status payload.");
+        }
+        metrics.put("tps", primaryTps);
 
         Double mspt = resolveAverageMspt();
         metrics.put("mspt", mspt != null ? mspt : 0.0D);
@@ -591,32 +773,204 @@ public class WebSocketSyncManager {
         metrics.put("memoryMaxMb", asLongValue(jvmMemory.get("max_mb")));
         metrics.put("uptimeSeconds", ManagementFactory.getRuntimeMXBean().getUptime() / 1000L);
 
-        Map<String, Object> motdPayload = resolveMotdPayload();
+        Map<String, Object> motdPayload = includeMotd
+                ? resolveMotdPayload(onlineCount, maxPlayers)
+                : buildDisabledMotdPayload();
         String motdClean = asStringValue(motdPayload.get("clean"));
         String motdSource = asStringValue(motdPayload.get("source"));
 
-        List<Map<String, Object>> playersList = new ArrayList<>(onlineCount);
-        for (Player player : onlinePlayers) {
-            Map<String, Object> playerDto = toPlayerDto(player);
-            String playerName = asStringValue(playerDto.get("name"));
-            if (playerName.isBlank()) {
-                playerName = player.getName() == null ? "" : player.getName();
-            }
-
-            Map<String, Object> publicPlayer = new LinkedHashMap<>();
-            publicPlayer.put("name", playerName);
-            publicPlayer.put("name_clean", stripMiniMessageToPlain(playerName));
-            publicPlayer.put("uuid", asStringValue(playerDto.get("uuid")));
-            playersList.add(publicPlayer);
-        }
+        List<Map<String, Object>> playersList = buildPublicPlayersList(onlinePlayers);
+        boolean listAvailable = exposePlayerList && (onlineCount == 0 || !playersList.isEmpty());
 
         Map<String, Object> playersPayload = new LinkedHashMap<>();
         playersPayload.put("online", onlineCount);
         playersPayload.put("max", maxPlayers);
         playersPayload.put("list", playersList);
+        playersPayload.put("list_available", listAvailable);
+        playersPayload.put("exposed", exposePlayerList);
+
+        String serverVersionName = resolveServerVersionName();
+        String bukkitVersion = safeGetBukkitVersion();
+
+        Map<String, Object> versionPayload = new LinkedHashMap<>();
+        versionPayload.put("name", serverVersionName);
+        versionPayload.put("name_clean", resolveVersionNameClean(bukkitVersion, serverVersionName));
+        versionPayload.put("bukkit", bukkitVersion);
+
+        Map<String, Object> serverPayload = new LinkedHashMap<>();
+        serverPayload.put("id", statusServerId);
+        serverPayload.put("name", statusServerName);
+        serverPayload.put("host", publicHost);
+        serverPayload.put("port", publicPort);
+        serverPayload.put("version", serverVersionName);
+
+        Map<String, Object> worldPayload = collectWorldPayload();
 
         Map<String, Object> serverInfo = new LinkedHashMap<>();
         serverInfo.put("motd", motdClean);
+        Map<String, Object> motdObject = buildMotdObject(motdPayload, motdSource, motdClean);
+        serverInfo.put("motdObject", motdObject);
+        serverInfo.put("world", asStringValue(worldPayload.get("primary")));
+        serverInfo.put("worlds", worldPayload);
+        serverInfo.put("host", publicHost);
+        serverInfo.put("port", publicPort);
+        serverInfo.put("address", formatServerAddress(publicHost, publicPort));
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("token", statusToken);
+        payload.put("type", "status");
+        payload.put("online", true);
+        payload.put("server", serverPayload);
+        payload.put("version", versionPayload);
+        payload.put("players", playersPayload);
+        payload.put("stats", metrics);
+        payload.put("motd", motdPayload);
+        payload.put("world", worldPayload);
+        payload.put("timestamp", System.currentTimeMillis());
+
+        // Legacy compatibility fields.
+        payload.put("onlinePlayers", onlineCount);
+        payload.put("maxPlayers", maxPlayers);
+        payload.put("playerList", buildLegacyPlayerList(playersList));
+        payload.put("playerListAvailable", listAvailable);
+        payload.put("playerListExposed", exposePlayerList);
+        payload.put("metrics", metrics);
+        payload.put("serverInfo", serverInfo);
+
+        enqueueStatusPayload(payload);
+    }
+
+    private OnlineSnapshot collectOnlineSnapshot() {
+        List<Player> onlinePlayers = new ArrayList<>();
+        int onlineCount = fallbackOnlinePlayers;
+        boolean usedFallback = false;
+
+        try {
+            Collection<? extends Player> current = Bukkit.getOnlinePlayers();
+            if (current != null) {
+                for (Player player : current) {
+                    if (player != null) {
+                        onlinePlayers.add(player);
+                    }
+                }
+                onlineCount = onlinePlayers.size();
+            } else {
+                usedFallback = true;
+                logStatusFallbackWithRateLimit(
+                        "Bukkit.getOnlinePlayers returned null, using status.fallback-online-players=" + fallbackOnlinePlayers + "."
+                );
+            }
+        } catch (Exception ex) {
+            usedFallback = true;
+            logStatusFallbackWithRateLimit(
+                    "Failed to read online players from Bukkit API, using status.fallback-online-players="
+                            + fallbackOnlinePlayers + ". reason=" + sanitizeStatusError(ex.getMessage())
+            );
+        }
+
+        int maxPlayers = fallbackMaxPlayers;
+        try {
+            maxPlayers = Bukkit.getMaxPlayers();
+            if (maxPlayers <= 0) {
+                throw new IllegalStateException("Bukkit max players <= 0");
+            }
+        } catch (Exception ex) {
+            usedFallback = true;
+            if (fallbackMaxPlayers > 0) {
+                maxPlayers = fallbackMaxPlayers;
+                logStatusFallbackWithRateLimit(
+                        "Failed to read max players from Bukkit API, using status.fallback-max-players="
+                                + fallbackMaxPlayers + ". reason=" + sanitizeStatusError(ex.getMessage())
+                );
+            } else {
+                maxPlayers = Math.max(onlineCount, 1);
+                logStatusFallbackWithRateLimit(
+                        "Failed to read max players from Bukkit API, status.fallback-max-players is not set; using derived value "
+                                + maxPlayers + ". reason=" + sanitizeStatusError(ex.getMessage())
+                );
+            }
+        }
+
+        if (maxPlayers < onlineCount) {
+            maxPlayers = onlineCount;
+        }
+
+        return new OnlineSnapshot(List.copyOf(onlinePlayers), onlineCount, maxPlayers, usedFallback);
+    }
+
+    private Double resolvePrimaryTps() {
+        List<Double> tpsValues = resolveTpsValues();
+        if (tpsValues.isEmpty()) {
+            return null;
+        }
+        return tpsValues.getFirst();
+    }
+
+    private List<Map<String, Object>> buildPublicPlayersList(List<Player> onlinePlayers) {
+        if (!exposePlayerList || onlinePlayers == null || onlinePlayers.isEmpty()) {
+            return List.of();
+        }
+
+        List<Map<String, Object>> players = new ArrayList<>(onlinePlayers.size());
+        for (Player player : onlinePlayers) {
+            if (player == null) {
+                continue;
+            }
+            Map<String, Object> dto = toPlayerDto(player);
+            players.add(dto);
+        }
+        return players;
+    }
+
+    private Map<String, Map<String, Object>> buildCurrentPlayersState(List<Player> onlinePlayers) {
+        Map<String, Map<String, Object>> currentPlayers = new LinkedHashMap<>();
+        if (onlinePlayers == null || onlinePlayers.isEmpty()) {
+            return currentPlayers;
+        }
+
+        for (Player player : onlinePlayers) {
+            if (player == null) {
+                continue;
+            }
+            Map<String, Object> playerDto = toPlayerDto(player);
+            String playerKey = resolvePlayerKey(playerDto);
+            if (playerKey != null && !playerKey.isBlank()) {
+                currentPlayers.put(playerKey, playerDto);
+            }
+        }
+        return currentPlayers;
+    }
+
+    private List<String> buildLegacyPlayerList(List<Map<String, Object>> playersList) {
+        if (playersList == null || playersList.isEmpty()) {
+            return List.of();
+        }
+        List<String> names = new ArrayList<>(playersList.size());
+        for (Map<String, Object> player : playersList) {
+            String name = asStringValue(player.get("name"));
+            if (!name.isBlank()) {
+                names.add(name);
+            }
+        }
+        return names;
+    }
+
+    private Map<String, Object> collectWorldPayload() {
+        List<String> worldNames = new ArrayList<>();
+        Bukkit.getWorlds().forEach(world -> {
+            if (world != null && world.getName() != null && !world.getName().isBlank()) {
+                worldNames.add(world.getName());
+            }
+        });
+
+        Map<String, Object> worldPayload = new LinkedHashMap<>();
+        worldPayload.put("primary", worldNames.isEmpty() ? "" : worldNames.getFirst());
+        worldPayload.put("count", worldNames.size());
+        worldPayload.put("names", worldNames);
+        return worldPayload;
+    }
+
+    private Map<String, Object> buildMotdObject(Map<String, Object> motdPayload, String motdSource, String motdClean) {
         Map<String, Object> motdObject = new LinkedHashMap<>();
         motdObject.put("source", motdSource);
         motdObject.put("clean", motdClean);
@@ -630,26 +984,262 @@ public class WebSocketSyncManager {
         if (!componentJson.isBlank()) {
             motdObject.put("componentJson", componentJson);
         }
-        serverInfo.put("motdObject", motdObject);
-        String worldName = "";
-        if (!Bukkit.getWorlds().isEmpty() && Bukkit.getWorlds().getFirst() != null) {
-            worldName = Bukkit.getWorlds().getFirst().getName();
+        return motdObject;
+    }
+
+    private Map<String, Object> buildDisabledMotdPayload() {
+        Map<String, Object> motdPayload = new LinkedHashMap<>();
+        motdPayload.put("source", "disabled");
+        motdPayload.put("format", "plain");
+        motdPayload.put("clean", "");
+        motdPayload.put("plain", "");
+        motdPayload.put("miniMessage", "");
+        motdPayload.put("lines", List.of());
+        motdPayload.put("html", "");
+        return motdPayload;
+    }
+
+    private Component resolveBukkitMotdComponent() {
+        try {
+            Method staticMethod = Bukkit.class.getMethod("motd");
+            Object staticValue = staticMethod.invoke(null);
+            if (staticValue instanceof Component component) {
+                return component;
+            }
+        } catch (Exception ignored) {
         }
-        serverInfo.put("world", worldName);
-        String host = Bukkit.getIp();
-        //noinspection ConstantConditions
-        String addressHost = (host == null || host.isBlank()) ? "0.0.0.0" : host;
-        serverInfo.put("address", addressHost + ":" + Bukkit.getPort());
+        Object serverValue = tryInvokeNoArgMethod(Bukkit.getServer(), "motd");
+        if (serverValue instanceof Component component) {
+            return component;
+        }
+        return null;
+    }
 
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("online", true);
-        payload.put("players", playersPayload);
-        payload.put("stats", metrics);
-        payload.put("motd", motdPayload);
-        payload.put("metrics", metrics);
-        payload.put("serverInfo", serverInfo);
+    private String resolveServerVersionName() {
+        String bukkitName = Bukkit.getName();
+        String minecraftVersion = resolveMinecraftVersion();
+        if (bukkitName != null && !bukkitName.isBlank() && minecraftVersion != null && !minecraftVersion.isBlank()) {
+            return bukkitName.trim() + " " + minecraftVersion.trim();
+        }
+        String bukkitVersion = safeGetBukkitVersion();
+        if (!bukkitVersion.isBlank()) {
+            return bukkitName == null || bukkitName.isBlank()
+                    ? bukkitVersion
+                    : bukkitName.trim() + " " + bukkitVersion;
+        }
+        String raw = Bukkit.getVersion();
+        return raw == null || raw.isBlank() ? "unknown" : raw.trim();
+    }
 
-        enqueueMessage(createSuccessEnvelope(TYPE_STATS_UPDATE, payload));
+    private String resolveMinecraftVersion() {
+        Object versionObject = tryInvokeNoArgMethod(Bukkit.getServer(), "getMinecraftVersion");
+        if (versionObject instanceof String version && !version.isBlank()) {
+            return version.trim();
+        }
+        String bukkitVersion = safeGetBukkitVersion();
+        if (bukkitVersion.isBlank()) {
+            return "";
+        }
+        int separatorIndex = bukkitVersion.indexOf('-');
+        String candidate = separatorIndex >= 0 ? bukkitVersion.substring(0, separatorIndex) : bukkitVersion;
+        return candidate.trim();
+    }
+
+    private String safeGetBukkitVersion() {
+        try {
+            String version = Bukkit.getBukkitVersion();
+            return version == null ? "" : version.trim();
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    private String resolveVersionNameClean(String bukkitVersion, String serverVersionName) {
+        if (bukkitVersion != null && !bukkitVersion.isBlank()) {
+            int separatorIndex = bukkitVersion.indexOf('-');
+            String candidate = separatorIndex >= 0 ? bukkitVersion.substring(0, separatorIndex) : bukkitVersion;
+            if (!candidate.isBlank()) {
+                return candidate.trim();
+            }
+        }
+        if (serverVersionName == null || serverVersionName.isBlank()) {
+            return "";
+        }
+        Matcher matcher = Pattern.compile("(\\d+\\.\\d+(?:\\.\\d+)?)").matcher(serverVersionName);
+        if (matcher.find()) {
+            return matcher.group(1);
+        }
+        return serverVersionName.trim();
+    }
+
+    private void markStatusPushQueued() {
+        long now = System.currentTimeMillis();
+        lastStatusPushAt = now;
+        if (enabled) {
+            lastStatusWebSocketResult = "queued";
+            lastStatusWebSocketResultAt = now;
+        }
+        if (statusHttpEnabled) {
+            lastStatusHttpResult = "pending";
+            lastStatusHttpResultAt = now;
+        }
+        refreshLastStatusSummary();
+    }
+
+    private void enqueueStatusPayload(Map<String, Object> payload) {
+        if (payload == null) {
+            return;
+        }
+        markStatusPushQueued();
+        if (statusHttpEnabled) {
+            dispatchStatusHttpPayload(payload);
+        }
+        if (enabled) {
+            enqueueMessage(createSuccessEnvelope(TYPE_SERVER_STATUS, payload));
+            enqueueMessage(createSuccessEnvelope(TYPE_STATS_UPDATE, payload));
+        }
+    }
+
+    private void markStatusPushSent() {
+        long now = System.currentTimeMillis();
+        lastStatusWebSocketResult = "sent";
+        lastStatusWebSocketResultAt = now;
+        refreshLastStatusSummary();
+    }
+
+    private void markStatusPushFailed(Throwable throwable) {
+        long now = System.currentTimeMillis();
+        String message = throwable == null ? "unknown" : throwable.getMessage();
+        lastStatusWebSocketResult = "send_failed: " + sanitizeStatusError(message);
+        lastStatusWebSocketResultAt = now;
+        refreshLastStatusSummary();
+    }
+
+    private void markStatusHttpSent(int statusCode) {
+        lastStatusHttpResult = "HTTP " + statusCode;
+        lastStatusHttpResultAt = System.currentTimeMillis();
+        refreshLastStatusSummary();
+    }
+
+    private void markStatusHttpFailed(String detail) {
+        lastStatusHttpResult = detail == null || detail.isBlank() ? "http_failed" : detail;
+        lastStatusHttpResultAt = System.currentTimeMillis();
+        refreshLastStatusSummary();
+    }
+
+    private void refreshLastStatusSummary() {
+        List<String> parts = new ArrayList<>(2);
+        long resultAt = lastStatusPushAt;
+        if (enabled) {
+            parts.add("ws=" + normalizeStatusResultValue(lastStatusWebSocketResult));
+            resultAt = Math.max(resultAt, lastStatusWebSocketResultAt);
+        }
+        if (statusHttpEnabled) {
+            parts.add("http=" + normalizeStatusResultValue(lastStatusHttpResult));
+            resultAt = Math.max(resultAt, lastStatusHttpResultAt);
+        }
+        lastStatusResult = parts.isEmpty() ? "disabled" : String.join(", ", parts);
+        lastStatusResultAt = resultAt;
+    }
+
+    private String normalizeStatusResultValue(String value) {
+        return value == null || value.isBlank() ? "never" : value;
+    }
+
+    private void dispatchStatusHttpPayload(Map<String, Object> payload) {
+        if (!statusHttpEnabled || statusHttpEndpoint == null || payload == null) {
+            return;
+        }
+
+        HttpRequest request = HttpRequest.newBuilder(statusHttpEndpoint)
+                .timeout(Duration.ofSeconds(statusHttpRequestTimeoutSeconds))
+                .header("Accept", "application/json")
+                .header("Content-Type", "application/json; charset=utf-8")
+                .header("User-Agent", "StellarStatsSync")
+                .POST(HttpRequest.BodyPublishers.ofString(gson.toJson(payload), StandardCharsets.UTF_8))
+                .build();
+
+        httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
+                .whenComplete((response, throwable) -> {
+                    if (throwable != null) {
+                        markStatusHttpFailed("send_failed: " + sanitizeStatusError(throwable.getMessage()));
+                        logStatusHttpWarnWithRateLimit("Status HTTP push failed: " + sanitizeStatusError(throwable.getMessage()));
+                        return;
+                    }
+
+                    if (response == null) {
+                        markStatusHttpFailed("empty_response");
+                        logStatusHttpWarnWithRateLimit("Status HTTP push failed: empty response.");
+                        return;
+                    }
+
+                    int statusCode = response.statusCode();
+                    if (statusCode >= 200 && statusCode < 300) {
+                        markStatusHttpSent(statusCode);
+                        return;
+                    }
+
+                    String preview = previewResponseBody(response.body());
+                    markStatusHttpFailed("HTTP " + statusCode);
+                    StringBuilder message = new StringBuilder("Status HTTP push failed with HTTP ");
+                    message.append(statusCode);
+                    if (!preview.isBlank()) {
+                        message.append(": ").append(sanitizeStatusError(preview));
+                    }
+                    logStatusHttpWarnWithRateLimit(message.toString());
+                });
+    }
+
+    private boolean isStatusEnvelope(MessageEnvelope message) {
+        if (message == null || message.type == null) {
+            return false;
+        }
+        return TYPE_STATS_UPDATE.equals(message.type) || TYPE_SERVER_STATUS.equals(message.type);
+    }
+
+    private void logStatusFallbackWithRateLimit(String message) {
+        long now = System.currentTimeMillis();
+        boolean shouldWarn = now - lastStatusFallbackWarnAt >= STATUS_FALLBACK_WARN_INTERVAL_MILLIS;
+        if (shouldWarn) {
+            lastStatusFallbackWarnAt = now;
+            logWarn(message);
+            return;
+        }
+        logDebug(message + " (suppressed by 60s rate limit)");
+    }
+
+    private void logStatusHttpWarnWithRateLimit(String message) {
+        long now = System.currentTimeMillis();
+        boolean shouldWarn = now - lastStatusHttpWarnAt >= STATUS_HTTP_WARN_INTERVAL_MILLIS;
+        if (shouldWarn) {
+            lastStatusHttpWarnAt = now;
+            plugin.getLogger().warning("[Status][HTTP] " + message);
+            return;
+        }
+        logDebug("[Status][HTTP] " + message + " (suppressed by 60s rate limit)");
+    }
+
+    private String sanitizeStatusError(String value) {
+        if (value == null || value.isBlank()) {
+            return "unknown";
+        }
+        String sanitized = value.trim();
+        sanitized = sanitized.replaceAll("(?i)(token|auth_token|password|authorization)\\s*[=:]\\s*[^\\s,;]+", "$1=***");
+        if (sanitized.length() > 120) {
+            sanitized = sanitized.substring(0, 120) + "...";
+        }
+        return sanitized;
+    }
+
+    private String previewResponseBody(String value) {
+        if (value == null || value.isBlank()) {
+            return "";
+        }
+        String normalized = value.replace('\r', ' ').replace('\n', ' ').trim();
+        if (normalized.length() <= STATUS_RESPONSE_PREVIEW_LIMIT) {
+            return normalized;
+        }
+        return normalized.substring(0, STATUS_RESPONSE_PREVIEW_LIMIT) + "...";
     }
 
     private Map<String, Object> collectJvmMemory() {
@@ -667,12 +1257,10 @@ public class WebSocketSyncManager {
         return memory;
     }
 
-    private Map<String, Object> resolveMotdPayload() {
+    private Map<String, Object> resolveMotdPayload(int onlinePlayers, int maxPlayers) {
         ConfigurationSection realtime = plugin.getConfig().getConfigurationSection("realtime");
         ConfigurationSection motdConfig = realtime != null ? realtime.getConfigurationSection("motd") : null;
 
-        int onlinePlayers = Bukkit.getOnlinePlayers().size();
-        int maxPlayers = Bukkit.getMaxPlayers();
         String configuredPlain = applyMotdPlaceholders(resolveConfiguredMotdPlain(motdConfig), onlinePlayers, maxPlayers);
         String configuredMiniMessage = applyMotdPlaceholders(resolveConfiguredMiniMessage(motdConfig), onlinePlayers, maxPlayers);
         String sourceMode = resolveMotdSourceMode(motdConfig);
@@ -708,7 +1296,7 @@ public class WebSocketSyncManager {
     }
 
     private Map<String, Object> buildBukkitMotdPayload(int onlinePlayers, int maxPlayers) {
-        Component motdComponent = Bukkit.motd();
+        Component motdComponent = resolveBukkitMotdComponent();
         String plainText = "";
         String legacyText = "";
         String componentJson = "";
@@ -720,6 +1308,9 @@ public class WebSocketSyncManager {
                 componentJson = GSON_COMPONENT_SERIALIZER.serialize(motdComponent);
             } catch (Exception ignored) {
             }
+        } else {
+            legacyText = Bukkit.getMotd();
+            plainText = stripMiniMessageToPlain(legacyText);
         }
 
         plainText = applyMotdPlaceholders(plainText, onlinePlayers, maxPlayers);
@@ -1050,6 +1641,18 @@ public class WebSocketSyncManager {
             return "";
         }
         return input
+                .replace("<online>", String.valueOf(onlinePlayers))
+                .replace("<max>", String.valueOf(maxPlayers))
+                .replace("<players_online>", String.valueOf(onlinePlayers))
+                .replace("<players_max>", String.valueOf(maxPlayers))
+                .replace("%online%", String.valueOf(onlinePlayers))
+                .replace("%max%", String.valueOf(maxPlayers))
+                .replace("%players_online%", String.valueOf(onlinePlayers))
+                .replace("%players_max%", String.valueOf(maxPlayers))
+                .replace("{online}", String.valueOf(onlinePlayers))
+                .replace("{max}", String.valueOf(maxPlayers))
+                .replace("{players_online}", String.valueOf(onlinePlayers))
+                .replace("{players_max}", String.valueOf(maxPlayers))
                 .replace("{onlinePlayers}", String.valueOf(onlinePlayers))
                 .replace("{maxPlayers}", String.valueOf(maxPlayers));
     }
@@ -1156,6 +1759,9 @@ public class WebSocketSyncManager {
             if (throwable != null) {
                 enqueueMessageFirst(message);
                 flushRunning.set(false);
+                if (isStatusEnvelope(message)) {
+                    markStatusPushFailed(throwable);
+                }
                 logSendFailureEnvelope(message.requestId);
                 recordReconnectFailure("send_failure", -1, throwable.getMessage());
                 logVerboseThrowable(throwable);
@@ -1165,6 +1771,9 @@ public class WebSocketSyncManager {
             }
 
             trackPendingAck(message);
+            if (isStatusEnvelope(message)) {
+                markStatusPushSent();
+            }
             sendNextQueuedMessage();
         });
     }
@@ -1392,6 +2001,10 @@ public class WebSocketSyncManager {
         return MessageEnvelope.success(type, data, requestId);
     }
 
+    private MessageEnvelope createEnvelope(String type, boolean success, int code, String message, Object data, String requestId) {
+        return MessageEnvelope.of(type, success, code, message, data, requestId);
+    }
+
     @SuppressWarnings("SameParameterValue")
     private MessageEnvelope createErrorEnvelope(int code, String errorMessage, String requestId) {
         return MessageEnvelope.error(TYPE_ERROR, code, errorMessage, requestId);
@@ -1399,23 +2012,14 @@ public class WebSocketSyncManager {
 
     private Map<String, Object> toPlayerDto(Player player) {
         Map<String, Object> dto = new LinkedHashMap<>();
-        dto.put("name", player.getName());
-        try {
-            dto.put("uuid", player.getUniqueId().toString());
-        } catch (Exception ignored) {
-        }
-        try {
-            //noinspection ConstantConditions
-            dto.put("world", player.getWorld() != null ? player.getWorld().getName() : null);
-        } catch (Exception ignored) {
-        }
-        try {
-            Method getPing = player.getClass().getMethod("getPing");
-            Object pingValue = getPing.invoke(player);
-            if (pingValue instanceof Number number) {
-                dto.put("ping", number.intValue());
+        String playerName = player.getName() == null ? "" : player.getName();
+        dto.put("name", playerName);
+        dto.put("name_clean", stripMiniMessageToPlain(playerName));
+        if (includePlayerUuid) {
+            try {
+                dto.put("uuid", player.getUniqueId().toString());
+            } catch (Exception ignored) {
             }
-        } catch (Exception ignored) {
         }
         return dto;
     }
@@ -1636,6 +2240,13 @@ public class WebSocketSyncManager {
         lastPongAt = 0L;
     }
 
+    private void clearTrackedPlayers() {
+        synchronized (playerStateLock) {
+            previousPlayers.clear();
+            versionMap.clear();
+        }
+    }
+
     private void handleInboundMessage(String rawPayload) {
         if (rawPayload == null || rawPayload.isBlank()) {
             return;
@@ -1663,6 +2274,32 @@ public class WebSocketSyncManager {
         if (TYPE_ACK.equalsIgnoreCase(messageType)) {
             String requestId = asNonBlankString(envelope.get("requestId"));
             removeFromPending(requestId);
+            return;
+        }
+
+        if (TYPE_SIGNIN_REQUEST.equalsIgnoreCase(messageType)) {
+            LiteSignInBridge bridge = this.liteSignInBridge;
+            if (bridge == null) {
+                Map<String, Object> result = new LinkedHashMap<>();
+                result.put("ok", false);
+                result.put("status", "bridge_unavailable");
+                result.put("message", "LiteSignIn bridge is not available.");
+                sendCustomEnvelope(
+                        TYPE_SIGNIN_RESULT,
+                        false,
+                        4100,
+                        "LiteSignIn bridge is not available.",
+                        result,
+                        asNonBlankString(envelope.get("requestId"))
+                );
+                return;
+            }
+
+            Object requestPayload = envelope.get("payload");
+            if (!(requestPayload instanceof Map<?, ?>)) {
+                requestPayload = envelope.get("data");
+            }
+            bridge.handleSignInRequest(asNonBlankString(envelope.get("requestId")), requestPayload);
             return;
         }
 
@@ -1818,11 +2455,96 @@ public class WebSocketSyncManager {
         return null;
     }
 
+    private boolean hasStatusTransportEnabled() {
+        return enabled || statusHttpEnabled;
+    }
+
     private String asNonBlankString(Object value) {
         if (value instanceof String string && !string.isBlank()) {
             return string;
         }
         return null;
+    }
+
+    private static String resolveDefaultPublicHost(URI endpoint) {
+        try {
+            String bukkitIp = Bukkit.getIp();
+            if (bukkitIp != null && !bukkitIp.isBlank()) {
+                return bukkitIp.trim();
+            }
+        } catch (Exception ignored) {
+        }
+
+        if (endpoint != null) {
+            String host = endpoint.getHost();
+            if (host != null && !host.isBlank()
+                    && !"127.0.0.1".equals(host)
+                    && !"0.0.0.0".equals(host)
+                    && !"localhost".equalsIgnoreCase(host)) {
+                return host.trim();
+            }
+        }
+        return "";
+    }
+
+    private static String resolveStatusToken(
+            ConfigurationSection status,
+            ConfigurationSection websocket,
+            FileConfiguration rootConfig
+    ) {
+        String resolved = firstNonBlank(
+                status == null ? null : status.getString("token"),
+                status == null ? null : status.getString("server-token"),
+                status == null ? null : status.getString("auth-token"),
+                websocket == null ? null : websocket.getString("auth_token"),
+                websocket == null ? null : websocket.getString("token"),
+                rootConfig == null ? null : rootConfig.getString("SERVER_TOKEN"),
+                rootConfig == null ? null : rootConfig.getString("server_token"),
+                rootConfig == null ? null : rootConfig.getString("token")
+        );
+        return resolved == null ? "" : resolved;
+    }
+
+    private static String resolveStatusHttpEndpoint(
+            ConfigurationSection status,
+            ConfigurationSection statusHttp,
+            FileConfiguration rootConfig
+    ) {
+        String resolved = firstNonBlank(
+                statusHttp == null ? null : statusHttp.getString("endpoint"),
+                statusHttp == null ? null : statusHttp.getString("url"),
+                status == null ? null : status.getString("endpoint"),
+                status == null ? null : status.getString("url"),
+                status == null ? null : status.getString("status-endpoint"),
+                status == null ? null : status.getString("server-status-url"),
+                rootConfig == null ? null : rootConfig.getString("SERVER_STATUS_URL"),
+                rootConfig == null ? null : rootConfig.getString("server_status_url")
+        );
+        return resolved == null ? "" : resolved;
+    }
+
+    private static String firstNonBlank(String... values) {
+        if (values == null || values.length == 0) {
+            return "";
+        }
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value.trim();
+            }
+        }
+        return "";
+    }
+
+    private static String sanitizeConfigError(String value) {
+        if (value == null || value.isBlank()) {
+            return "unknown";
+        }
+        String sanitized = value.trim();
+        sanitized = sanitized.replaceAll("(?i)(token|auth_token|password|authorization)\\s*[=:]\\s*[^\\s,;]+", "$1=***");
+        if (sanitized.length() > 160) {
+            sanitized = sanitized.substring(0, 160) + "...";
+        }
+        return sanitized;
     }
 
     private static String buildWsUrl(String serverUrl, String path) {
@@ -1854,6 +2576,14 @@ public class WebSocketSyncManager {
 
     private static long bytesToMb(long value) {
         return value / (1024L * 1024L);
+    }
+
+    private static String formatServerAddress(String host, int port) {
+        String safeHost = host == null ? "" : host.trim();
+        if (safeHost.isBlank()) {
+            return Integer.toString(Math.max(0, port));
+        }
+        return safeHost + ":" + port;
     }
 
     private void cancelTask(BukkitTask task) {
@@ -1943,6 +2673,14 @@ public class WebSocketSyncManager {
         private boolean isEmpty() {
             return add.isEmpty() && remove.isEmpty() && update.isEmpty();
         }
+    }
+
+    private record OnlineSnapshot(
+            List<Player> onlinePlayers,
+            int onlineCount,
+            int maxPlayers,
+            boolean usedFallback
+    ) {
     }
 
     private final class WsListener implements WebSocket.Listener {

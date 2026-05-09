@@ -20,17 +20,7 @@ public class MessageEnvelope {
     }
 
     public static MessageEnvelope success(String type, Object data, String requestId) {
-        MessageEnvelope msg = new MessageEnvelope();
-        msg.type = type;
-        msg.success = true;
-        msg.code = 0;
-        msg.message = "ok";
-        msg.requestId = normalizeRequestId(requestId);
-        msg.timestamp = System.currentTimeMillis();
-        Object safeData = normalizeData(data);
-        msg.data = safeData;
-        msg.payload = safeData;
-        return msg;
+        return of(type, true, 0, "ok", data, requestId);
     }
 
     @SuppressWarnings("unused")
@@ -40,16 +30,20 @@ public class MessageEnvelope {
     }
 
     public static MessageEnvelope error(String type, int code, String message, String requestId) {
+        return of(type, false, code, message, null, requestId);
+    }
+
+    public static MessageEnvelope of(String type, boolean success, int code, String message, Object data, String requestId) {
         MessageEnvelope msg = new MessageEnvelope();
         msg.type = type;
-        msg.success = false;
-        msg.code = code;
+        msg.success = success;
+        msg.code = Math.max(0, code);
         msg.message = message == null ? "" : message;
         msg.requestId = normalizeRequestId(requestId);
         msg.timestamp = System.currentTimeMillis();
-        Object emptyData = normalizeData(null);
-        msg.data = emptyData;
-        msg.payload = emptyData;
+        Object safeData = normalizeData(data);
+        msg.data = safeData;
+        msg.payload = safeData;
         return msg;
     }
 

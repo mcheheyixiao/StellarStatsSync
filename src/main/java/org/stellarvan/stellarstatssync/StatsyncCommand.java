@@ -6,6 +6,7 @@ import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
+import org.stellarvan.stellarstatssync.bridge.litesignin.LiteSignInBridge;
 
 import java.util.Locale;
 import java.util.logging.Level;
@@ -18,7 +19,7 @@ public class StatsyncCommand implements CommandExecutor {
     private final SyncTask syncTask;
     private final DatabaseManager databaseManager;
     private final WebSocketSyncManager webSocketSyncManager;
-    private final CheckinRewardPoller checkinRewardPoller;
+    private final LiteSignInBridge liteSignInBridge;
     private volatile long lastManualSyncAt = 0L;
 
     public StatsyncCommand(
@@ -26,13 +27,13 @@ public class StatsyncCommand implements CommandExecutor {
             SyncTask syncTask,
             DatabaseManager databaseManager,
             WebSocketSyncManager webSocketSyncManager,
-            CheckinRewardPoller checkinRewardPoller
+            LiteSignInBridge liteSignInBridge
     ) {
         this.plugin = plugin;
         this.syncTask = syncTask;
         this.databaseManager = databaseManager;
         this.webSocketSyncManager = webSocketSyncManager;
-        this.checkinRewardPoller = checkinRewardPoller;
+        this.liteSignInBridge = liteSignInBridge;
     }
 
     @Override
@@ -106,10 +107,16 @@ public class StatsyncCommand implements CommandExecutor {
         boolean webSocketEnabled = false;
         boolean connected = false;
         boolean pluginStatusSyncEnabled = false;
+        boolean statusSyncEnabled = false;
+        boolean statusHttpEnabled = false;
+        boolean playerListExposed = false;
         String endpoint = "-";
+        String httpEndpoint = "-";
         int queueSize = 0;
         int pendingAck = 0;
         long lastPongAt = 0L;
+        long lastStatusPushAt = 0L;
+        String lastStatusResult = "never";
         int reconnectFailures = 0;
         String lastReconnectReason = "none";
         int playersVersion = 0;
@@ -118,6 +125,9 @@ public class StatsyncCommand implements CommandExecutor {
             webSocketEnabled = manager.isEnabled();
             connected = manager.isConnected();
             pluginStatusSyncEnabled = manager.isPluginStatusSyncEnabled();
+            statusSyncEnabled = manager.isStatusSyncEnabled();
+            statusHttpEnabled = manager.isStatusHttpEnabled();
+            playerListExposed = manager.isPlayerListExposed();
             if (!webSocketEnabled) {
                 webSocketState = "disabled";
             } else if (connected) {
@@ -126,19 +136,35 @@ public class StatsyncCommand implements CommandExecutor {
                 webSocketState = "disconnected";
             }
             endpoint = manager.getMaskedEndpoint();
+            httpEndpoint = manager.getMaskedStatusHttpEndpoint();
             queueSize = manager.getQueueSize();
             pendingAck = manager.getPendingAckSize();
             lastPongAt = manager.getLastPongAt();
+            lastStatusPushAt = manager.getLastStatusPushAt();
+            lastStatusResult = manager.getLastStatusResult();
             reconnectFailures = manager.getReconnectFailures();
             lastReconnectReason = manager.getLastReconnectReason();
             playersVersion = manager.getLastKnownPlayersVersion();
         }
 
+        int onlinePlayers = Bukkit.getOnlinePlayers().size();
+        int maxPlayers = Bukkit.getMaxPlayers();
+        boolean endpointConfigured = (webSocketEnabled && endpoint != null && !endpoint.isBlank() && !"-".equals(endpoint))
+                || (statusHttpEnabled && httpEndpoint != null && !httpEndpoint.isBlank() && !"-".equals(httpEndpoint));
+
         sender.sendMessage("[StellarStatsSync]");
+        sender.sendMessage("Status sync: " + (statusSyncEnabled ? "enabled" : "disabled"));
+        sender.sendMessage("Online: " + onlinePlayers + "/" + maxPlayers);
+        sender.sendMessage("Player list exposed: " + playerListExposed);
+        sender.sendMessage("Endpoint: " + (endpointConfigured ? "configured" : "not configured"));
+        sender.sendMessage("Last push: " + formatDurationAgo(lastStatusPushAt));
+        sender.sendMessage("Last result: " + safeValue(lastStatusResult));
         sender.sendMessage("WebSocket: " + webSocketState);
         sender.sendMessage("WebSocket enabled: " + webSocketEnabled);
         sender.sendMessage("Connected: " + connected);
-        sender.sendMessage("Endpoint: " + endpoint);
+        sender.sendMessage("WebSocket endpoint: " + safeValue(endpoint));
+        sender.sendMessage("HTTP status enabled: " + statusHttpEnabled);
+        sender.sendMessage("HTTP endpoint: " + safeValue(httpEndpoint));
         sender.sendMessage("Queue size: " + queueSize);
         sender.sendMessage("Pending ACK: " + pendingAck);
         sender.sendMessage("Last pong: " + formatDurationAgo(lastPongAt));
@@ -155,7 +181,7 @@ public class StatsyncCommand implements CommandExecutor {
         }
 
         WebSocketSyncManager manager = this.webSocketSyncManager;
-        CheckinRewardPoller poller = this.checkinRewardPoller;
+        LiteSignInBridge bridge = this.liteSignInBridge;
         DatabaseManager dbManager = this.databaseManager;
 
         sender.sendMessage("[StellarStatsSync Doctor]");
@@ -175,6 +201,8 @@ public class StatsyncCommand implements CommandExecutor {
         boolean webSocketEnabled = false;
         boolean connected = false;
         String endpoint = "-";
+        boolean statusHttpEnabled = false;
+        String httpEndpoint = "-";
         int queueSize = -1;
         int pendingAck = -1;
         long lastPongAt = 0L;
@@ -192,6 +220,8 @@ public class StatsyncCommand implements CommandExecutor {
                 webSocketState = "disconnected";
             }
             endpoint = manager.getMaskedEndpoint();
+            statusHttpEnabled = manager.isStatusHttpEnabled();
+            httpEndpoint = manager.getMaskedStatusHttpEndpoint();
             queueSize = manager.getQueueSize();
             pendingAck = manager.getPendingAckSize();
             lastPongAt = manager.getLastPongAt();
@@ -209,20 +239,23 @@ public class StatsyncCommand implements CommandExecutor {
         sender.sendMessage("- reconnectFailures: " + formatCount(reconnectFailures));
         sender.sendMessage("- lastReconnectReason: " + sanitizeError(safeValue(lastReconnectReason)));
         sender.sendMessage("- state: " + webSocketState);
+        sender.sendMessage("HTTP Status:");
+        sender.sendMessage("- enabled: " + statusHttpEnabled);
+        sender.sendMessage("- endpoint: " + safeValue(httpEndpoint));
 
-        CheckinRewardPoller.CheckinDoctorSnapshot checkinSnapshot =
-                poller == null ? null : poller.getDoctorSnapshot();
-        sender.sendMessage("Checkin:");
-        sender.sendMessage("- enabled: " + (checkinSnapshot != null && checkinSnapshot.enabled()));
-        sender.sendMessage("- running: " + (checkinSnapshot != null && checkinSnapshot.started()));
-        sender.sendMessage("- apiBase: " + (checkinSnapshot == null ? "unavailable" : safeValue(checkinSnapshot.maskedApiBase())));
-        sender.sendMessage("- lastPoll: " + (checkinSnapshot == null ? "unavailable" : formatDurationAgo(checkinSnapshot.lastPollAt())));
-        sender.sendMessage("- lastError: " + (checkinSnapshot == null ? "unavailable" : sanitizeError(checkinSnapshot.lastError())));
-        sender.sendMessage("- processing: " + (checkinSnapshot == null ? "unavailable" : checkinSnapshot.processingCount()));
-        sender.sendMessage("- recentAckCache: " + (checkinSnapshot == null ? "unavailable" : checkinSnapshot.recentAckCacheSize()));
-        sender.sendMessage("- pollRunning: " + (checkinSnapshot != null && checkinSnapshot.pollRunning()));
-        if (checkinSnapshot != null && !checkinSnapshot.enabled()) {
-            sender.sendMessage("- disabledReason: " + sanitizeError(checkinSnapshot.disabledReason()));
+        LiteSignInBridge.SignInDoctorSnapshot signInSnapshot =
+                bridge == null ? null : bridge.getDoctorSnapshot();
+        sender.sendMessage("SignIn:");
+        sender.sendMessage("- enabled: " + (signInSnapshot != null && signInSnapshot.enabled()));
+        sender.sendMessage("- provider: " + (signInSnapshot == null ? "unavailable" : safeValue(signInSnapshot.provider())));
+        sender.sendMessage("- providerAvailable: " + (signInSnapshot != null && signInSnapshot.providerAvailable()));
+        sender.sendMessage("- providerEnabled: " + (signInSnapshot != null && signInSnapshot.providerEnabled()));
+        sender.sendMessage("- eventListening: " + (signInSnapshot != null && signInSnapshot.eventListening()));
+        sender.sendMessage("- requirePlayerOnline: " + (signInSnapshot != null && signInSnapshot.requirePlayerOnline()));
+        sender.sendMessage("- sendGameUpdates: " + (signInSnapshot != null && signInSnapshot.sendGameSignInUpdates()));
+        sender.sendMessage("- requestContexts: " + (signInSnapshot == null ? "unavailable" : signInSnapshot.requestContextSize()));
+        if (signInSnapshot != null && signInSnapshot.disabledReason() != null && !signInSnapshot.disabledReason().isBlank() && !"-".equals(signInSnapshot.disabledReason())) {
+            sender.sendMessage("- disabledReason: " + sanitizeError(signInSnapshot.disabledReason()));
         }
 
         sender.sendMessage("Sync:");
