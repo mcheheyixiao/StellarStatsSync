@@ -250,6 +250,9 @@ public class StatsyncCommand implements CommandExecutor {
         if (rewardWorker == null) {
             sender.sendMessage("RewardOutbox:");
             sender.sendMessage("- enabled: false");
+            sender.sendMessage("- schemaReady: false");
+            sender.sendMessage("- schemaError: unavailable");
+            sender.sendMessage("- serverId: unavailable");
             sender.sendMessage("- sweetMailInstalled: false");
             sender.sendMessage("- sweetMailEnabled: false");
             sender.sendMessage("- commandsEnabled: false");
@@ -263,6 +266,9 @@ public class StatsyncCommand implements CommandExecutor {
             RewardOutboxWorker.RewardOutboxDoctorSnapshot cachedRewardSnapshot = rewardWorker.getCachedDoctorSnapshot();
             sender.sendMessage("RewardOutbox:");
             sender.sendMessage("- enabled: " + cachedRewardSnapshot.enabled());
+            sender.sendMessage("- schemaReady: " + cachedRewardSnapshot.schemaReady());
+            sender.sendMessage("- schemaError: " + sanitizeError(cachedRewardSnapshot.schemaError()));
+            sender.sendMessage("- serverId: " + safeValue(cachedRewardSnapshot.serverId()));
             sender.sendMessage("- sweetMailInstalled: " + cachedRewardSnapshot.sweetMailInstalled());
             sender.sendMessage("- sweetMailEnabled: " + cachedRewardSnapshot.sweetMailEnabled());
             sender.sendMessage("- commandsEnabled: " + cachedRewardSnapshot.commandsEnabled());
@@ -285,6 +291,9 @@ public class StatsyncCommand implements CommandExecutor {
                 }
 
                 sender.sendMessage("[StellarStatsSync Doctor][RewardOutbox]");
+                sender.sendMessage("- schemaReady: " + snapshot.schemaReady());
+                sender.sendMessage("- schemaError: " + sanitizeError(snapshot.schemaError()));
+                sender.sendMessage("- serverId: " + safeValue(snapshot.serverId()));
                 sender.sendMessage("- pending: " + formatCount(snapshot.pending()));
                 sender.sendMessage("- processing: " + formatCount(snapshot.processing()));
                 sender.sendMessage("- failed: " + formatCount(snapshot.failed()));

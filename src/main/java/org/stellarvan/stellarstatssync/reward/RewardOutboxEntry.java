@@ -10,6 +10,7 @@ public record RewardOutboxEntry(
         String source,
         String rewardType,
         String rewardPayloadJson,
-        int attempts
+        int attempts,
+        String signDate
 ) {
 }

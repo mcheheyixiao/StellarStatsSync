@@ -24,6 +24,7 @@ import java.util.logging.Level;
 public final class RewardOutboxWorker {
 
     private static final String DEFAULT_MAIL_TITLE = "每日签到奖励";
+    private static final String PARTIAL_RISK_MESSAGE = "\u53ef\u80fd\u90e8\u5206\u53d1\u653e\uff0c\u9700\u8981\u4eba\u5de5\u590d\u6838\u3002";
 
     private final StellarStatsSync plugin;
     private final Gson gson;
@@ -35,6 +36,8 @@ public final class RewardOutboxWorker {
     private volatile BukkitTask pollTask;
     private volatile long lastPollAt = 0L;
     private volatile String lastError = "-";
+    private volatile boolean schemaReady = false;
+    private volatile String schemaError = "-";
     private volatile RewardOutboxRepository.RewardOutboxCounts lastCounts = RewardOutboxRepository.RewardOutboxCounts.unavailable();
 
     public RewardOutboxWorker(StellarStatsSync plugin, DatabaseManager databaseManager) {
@@ -52,6 +55,21 @@ public final class RewardOutboxWorker {
 
         if (!settings.enabled()) {
             plugin.getLogger().info("[RewardOutbox] Disabled by config.");
+            return;
+        }
+
+        try {
+            repository.ensureSchema();
+            schemaReady = true;
+            schemaError = "-";
+        } catch (Exception ex) {
+            schemaReady = false;
+            schemaError = sanitizeError("Reward outbox schema check failed: " + summarize(ex));
+            lastError = schemaError;
+            plugin.getLogger().warning("[RewardOutbox] " + schemaError);
+            if (isDebugEnabled()) {
+                plugin.getLogger().log(Level.WARNING, "[RewardOutbox][Debug] Schema ensure failure", ex);
+            }
             return;
         }
 
@@ -85,6 +103,9 @@ public final class RewardOutboxWorker {
         RewardOutboxRepository.RewardOutboxCounts counts = lastCounts;
         return new RewardOutboxDoctorSnapshot(
                 settings.enabled(),
+                schemaReady,
+                schemaError,
+                settings.serverId(),
                 sweetMailDispatcher.isPluginInstalled(),
                 settings.sweetMail().enabled() && sweetMailDispatcher.isPluginEnabled(),
                 settings.commands().enabled(),
@@ -99,7 +120,7 @@ public final class RewardOutboxWorker {
 
     public CompletableFuture<RewardOutboxDoctorSnapshot> collectDoctorSnapshotAsync() {
         RewardOutboxDoctorSnapshot cached = getCachedDoctorSnapshot();
-        if (!plugin.isEnabled() || plugin.isShuttingDown()) {
+        if (!plugin.isEnabled() || plugin.isShuttingDown() || !schemaReady) {
             return CompletableFuture.completedFuture(cached);
         }
         return repository.fetchCountsAsync(settings.serverId()).handle((counts, throwable) -> {
@@ -107,6 +128,9 @@ public final class RewardOutboxWorker {
                 lastCounts = counts;
                 return new RewardOutboxDoctorSnapshot(
                         cached.enabled(),
+                        cached.schemaReady(),
+                        cached.schemaError(),
+                        cached.serverId(),
                         cached.sweetMailInstalled(),
                         cached.sweetMailEnabled(),
                         cached.commandsEnabled(),
@@ -121,6 +145,9 @@ public final class RewardOutboxWorker {
             String mergedError = mergeErrors(cached.lastError(), summarize(throwable));
             return new RewardOutboxDoctorSnapshot(
                     cached.enabled(),
+                    cached.schemaReady(),
+                    cached.schemaError(),
+                    cached.serverId(),
                     cached.sweetMailInstalled(),
                     cached.sweetMailEnabled(),
                     cached.commandsEnabled(),
@@ -135,7 +162,7 @@ public final class RewardOutboxWorker {
     }
 
     private void pollSafely() {
-        if (!settings.enabled() || plugin.isShuttingDown()) {
+        if (!settings.enabled() || plugin.isShuttingDown() || !schemaReady) {
             return;
         }
         if (!polling.compareAndSet(false, true)) {
@@ -219,6 +246,18 @@ public final class RewardOutboxWorker {
     }
 
     private ProcessResult processClaimedEntry(RewardOutboxEntry entry) {
+        try {
+            if (repository.hasDeliveredRewardForDay(entry)) {
+                return ProcessResult.failure(
+                        "A delivered reward already exists for the same player/server/source/sign_date. " + PARTIAL_RISK_MESSAGE,
+                        true,
+                        false
+                );
+            }
+        } catch (Exception ex) {
+            return ProcessResult.failure("Failed to check duplicate daily reward state: " + summarize(ex), false, false);
+        }
+
         RewardPayload payload;
         try {
             payload = RewardPayload.parse(gson, entry.rewardPayloadJson());
@@ -281,14 +320,14 @@ public final class RewardOutboxWorker {
         } catch (RewardDispatchException ex) {
             String message = ex.getMessage();
             if (mailDelivered && !ex.partialRisk()) {
-                message = mergeErrors(message, "SweetMail already accepted the mail. Manual review is required before retrying.");
+                message = mergeErrors(message, PARTIAL_RISK_MESSAGE);
             }
             boolean forceFailed = mailDelivered || ex.partialRisk();
             return ProcessResult.failure(message, forceFailed, forceFailed);
         } catch (Exception ex) {
             String message = summarize(ex);
             if (mailDelivered) {
-                message = mergeErrors(message, "SweetMail already accepted the mail. Manual review is required before retrying.");
+                message = mergeErrors(message, PARTIAL_RISK_MESSAGE);
             }
             return ProcessResult.failure(message, mailDelivered, mailDelivered);
         }
@@ -409,7 +448,8 @@ public final class RewardOutboxWorker {
                 String detail = summarize(ex);
                 if (executed > 0) {
                     throw new RewardDispatchException(
-                            "Reward command execution failed after " + executed + " command(s). Partial reward issuance is possible. Failing command: " + command + ". Reason: " + detail,
+                            "Reward command execution failed after " + executed + " command(s). " + PARTIAL_RISK_MESSAGE
+                                    + " Failing command: " + command + ". Reason: " + detail,
                             false,
                             true,
                             ex
@@ -454,6 +494,7 @@ public final class RewardOutboxWorker {
                 + ", requestId=" + safeValue(entry.requestId())
                 + ", player=" + safeValue(entry.playerName())
                 + ", rewardType=" + safeValue(entry.rewardType())
+                + ", signDate=" + safeValue(entry.signDate())
                 + ", attempt=" + currentAttempt
                 + ", delivered=" + result.delivered()
                 + ", forceFailed=" + result.forceFailed()
@@ -525,6 +566,9 @@ public final class RewardOutboxWorker {
 
     public record RewardOutboxDoctorSnapshot(
             boolean enabled,
+            boolean schemaReady,
+            String schemaError,
+            String serverId,
             boolean sweetMailInstalled,
             boolean sweetMailEnabled,
             boolean commandsEnabled,
@@ -546,9 +590,13 @@ public final class RewardOutboxWorker {
             int total
     ) {
         private static PlaceholderContext from(RewardOutboxEntry entry, RewardPayload.Meta meta) {
-            String signDate = meta == null || meta.signDate() == null || meta.signDate().isBlank()
+            String payloadSignDate = meta == null || meta.signDate() == null || meta.signDate().isBlank()
                     ? ""
                     : meta.signDate().trim();
+            String entrySignDate = entry.signDate() == null || entry.signDate().isBlank()
+                    ? ""
+                    : entry.signDate().trim();
+            String signDate = payloadSignDate.isBlank() ? entrySignDate : payloadSignDate;
             return new PlaceholderContext(
                     entry.requestId() == null ? "" : entry.requestId().trim(),
                     entry.playerUuid() == null ? "" : entry.playerUuid().trim(),
@@ -588,9 +636,7 @@ public final class RewardOutboxWorker {
         }
 
         private static ProcessResult failure(String error, boolean forceFailed, boolean partialRisk) {
-            String suffix = partialRisk
-                    ? " Manual review is required because partial reward issuance is possible."
-                    : "";
+            String suffix = partialRisk ? " " + PARTIAL_RISK_MESSAGE : "";
             return new ProcessResult(false, forceFailed, sanitizeError(error + suffix));
         }
     }
