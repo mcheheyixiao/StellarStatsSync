@@ -3,7 +3,7 @@ package org.stellarvan.stellarstatssync;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.command.PluginCommand;
 import org.bukkit.plugin.java.JavaPlugin;
-import org.stellarvan.stellarstatssync.bridge.litesignin.LiteSignInBridge;
+import org.stellarvan.stellarstatssync.reward.RewardOutboxWorker;
 
 import java.util.logging.Level;
 
@@ -15,7 +15,7 @@ public class StellarStatsSync extends JavaPlugin {
     private DatabaseManager databaseManager;
     private SyncTask syncTask;
     private WebSocketSyncManager webSocketSyncManager;
-    private LiteSignInBridge liteSignInBridge;
+    private RewardOutboxWorker rewardOutboxWorker;
 
     public static boolean isDebug() {
         return DEBUG;
@@ -44,8 +44,7 @@ public class StellarStatsSync extends JavaPlugin {
 
         getServer().getPluginManager().registerEvents(new PlayerQuitListener(this, syncTask, databaseManager), this);
         this.webSocketSyncManager = new WebSocketSyncManager(this);
-        this.liteSignInBridge = new LiteSignInBridge(this, webSocketSyncManager);
-        this.webSocketSyncManager.setLiteSignInBridge(liteSignInBridge);
+        this.rewardOutboxWorker = new RewardOutboxWorker(this, databaseManager);
 
         if (webSocketSyncManager.shouldStart()) {
             webSocketSyncManager.start();
@@ -63,7 +62,7 @@ public class StellarStatsSync extends JavaPlugin {
             getLogger().info("Realtime status sync disabled by config.");
         }
 
-        liteSignInBridge.start();
+        rewardOutboxWorker.start();
 
         PluginCommand statsyncCommand = getCommand("statsync");
         if (statsyncCommand != null) {
@@ -72,7 +71,7 @@ public class StellarStatsSync extends JavaPlugin {
                     syncTask,
                     databaseManager,
                     webSocketSyncManager,
-                    liteSignInBridge
+                    rewardOutboxWorker
             ));
         } else {
             getLogger().warning("Command 'statsync' not found in plugin.yml");
@@ -84,8 +83,8 @@ public class StellarStatsSync extends JavaPlugin {
     @Override
     public void onDisable() {
         this.isShuttingDown = true;
-        if (liteSignInBridge != null) {
-            liteSignInBridge.shutdown();
+        if (rewardOutboxWorker != null) {
+            rewardOutboxWorker.shutdown();
         }
         if (webSocketSyncManager != null) {
             webSocketSyncManager.shutdown();

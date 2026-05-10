@@ -61,6 +61,13 @@ public class DatabaseManager {
         return dataSource != null && !dataSource.isClosed();
     }
 
+    public Connection openConnection() throws SQLException {
+        if (!isPoolAvailable()) {
+            throw new SQLException("Database connection pool is unavailable.");
+        }
+        return dataSource.getConnection();
+    }
+
     public CompletableFuture<DatabaseHealth> checkHealthAsync() {
         if (!plugin.isEnabled()) {
             return CompletableFuture.completedFuture(new DatabaseHealth(false, -1L, "plugin disabled"));
@@ -76,7 +83,7 @@ public class DatabaseManager {
         try {
             Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
                 long startedAtNanos = System.nanoTime();
-                try (Connection connection = dataSource.getConnection();
+                try (Connection connection = openConnection();
                      PreparedStatement stmt = connection.prepareStatement("SELECT 1");
                      ResultSet rs = stmt.executeQuery()) {
                     boolean ok = rs.next();
@@ -166,7 +173,7 @@ public class DatabaseManager {
                         "  blocks_mined = VALUES(blocks_mined), " +
                         "  blocks_placed = VALUES(blocks_placed)";
 
-        try (Connection connection = dataSource.getConnection();
+        try (Connection connection = openConnection();
              PreparedStatement stmt = connection.prepareStatement(sql)) {
 
             for (SyncTask.PlayerStatsSnapshot snapshot : snapshots) {

@@ -16,6 +16,10 @@ repositories {
         name = "papermc-repo"
         url = "https://repo.papermc.io/repository/maven-public/"
     }
+    maven {
+        name = "jitpack"
+        url = "https://jitpack.io"
+    }
 }
 
 dependencies {
@@ -24,6 +28,7 @@ dependencies {
     implementation("com.zaxxer:HikariCP:5.1.0")
     implementation("com.mysql:mysql-connector-j:8.4.0")
     implementation("com.google.code.gson:gson:2.11.0")
+    compileOnly("com.github.MrXiaoM:SweetMail:1.1.8")
 }
 
 tasks {

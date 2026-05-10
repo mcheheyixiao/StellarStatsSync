@@ -6,7 +6,7 @@ import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
-import org.stellarvan.stellarstatssync.bridge.litesignin.LiteSignInBridge;
+import org.stellarvan.stellarstatssync.reward.RewardOutboxWorker;
 
 import java.util.Locale;
 import java.util.logging.Level;
@@ -19,7 +19,7 @@ public class StatsyncCommand implements CommandExecutor {
     private final SyncTask syncTask;
     private final DatabaseManager databaseManager;
     private final WebSocketSyncManager webSocketSyncManager;
-    private final LiteSignInBridge liteSignInBridge;
+    private final RewardOutboxWorker rewardOutboxWorker;
     private volatile long lastManualSyncAt = 0L;
 
     public StatsyncCommand(
@@ -27,13 +27,13 @@ public class StatsyncCommand implements CommandExecutor {
             SyncTask syncTask,
             DatabaseManager databaseManager,
             WebSocketSyncManager webSocketSyncManager,
-            LiteSignInBridge liteSignInBridge
+            RewardOutboxWorker rewardOutboxWorker
     ) {
         this.plugin = plugin;
         this.syncTask = syncTask;
         this.databaseManager = databaseManager;
         this.webSocketSyncManager = webSocketSyncManager;
-        this.liteSignInBridge = liteSignInBridge;
+        this.rewardOutboxWorker = rewardOutboxWorker;
     }
 
     @Override
@@ -181,8 +181,8 @@ public class StatsyncCommand implements CommandExecutor {
         }
 
         WebSocketSyncManager manager = this.webSocketSyncManager;
-        LiteSignInBridge bridge = this.liteSignInBridge;
         DatabaseManager dbManager = this.databaseManager;
+        RewardOutboxWorker rewardWorker = this.rewardOutboxWorker;
 
         sender.sendMessage("[StellarStatsSync Doctor]");
         sender.sendMessage("Plugin: " + (plugin.isEnabled() ? "enabled" : "disabled"));
@@ -243,24 +243,56 @@ public class StatsyncCommand implements CommandExecutor {
         sender.sendMessage("- enabled: " + statusHttpEnabled);
         sender.sendMessage("- endpoint: " + safeValue(httpEndpoint));
 
-        LiteSignInBridge.SignInDoctorSnapshot signInSnapshot =
-                bridge == null ? null : bridge.getDoctorSnapshot();
-        sender.sendMessage("SignIn:");
-        sender.sendMessage("- bridgeEnabled: " + (signInSnapshot != null && signInSnapshot.enabled()));
-        sender.sendMessage("- provider: " + (signInSnapshot == null ? "unavailable" : safeValue(signInSnapshot.provider())));
-        sender.sendMessage("- liteSignInInstalled: " + (signInSnapshot != null && signInSnapshot.providerAvailable()));
-        sender.sendMessage("- liteSignInEnabled: " + (signInSnapshot != null && signInSnapshot.providerEnabled()));
-        sender.sendMessage("- eventListening: " + (signInSnapshot != null && signInSnapshot.eventListening()));
-        sender.sendMessage("- requirePlayerOnline: " + (signInSnapshot != null && signInSnapshot.requirePlayerOnline()));
-        sender.sendMessage("- sendGameUpdates: " + (signInSnapshot != null && signInSnapshot.sendGameSignInUpdates()));
-        sender.sendMessage("- requestContextSize: " + (signInSnapshot == null ? "unavailable" : signInSnapshot.requestContextSize()));
-        if (signInSnapshot != null && signInSnapshot.disabledReason() != null && !signInSnapshot.disabledReason().isBlank() && !"-".equals(signInSnapshot.disabledReason())) {
-            sender.sendMessage("- disabledReason: " + sanitizeError(signInSnapshot.disabledReason()));
-        }
-
         sender.sendMessage("Sync:");
         sender.sendMessage("- intervalTicks: " + plugin.getConfig().getLong("sync_interval_ticks", 12000L));
         sender.sendMessage("- lastManualSync: " + (lastManualSyncAt <= 0L ? "unknown" : formatDurationAgo(lastManualSyncAt)));
+
+        if (rewardWorker == null) {
+            sender.sendMessage("RewardOutbox:");
+            sender.sendMessage("- enabled: false");
+            sender.sendMessage("- sweetMailInstalled: false");
+            sender.sendMessage("- sweetMailEnabled: false");
+            sender.sendMessage("- commandsEnabled: false");
+            sender.sendMessage("- pending: unavailable");
+            sender.sendMessage("- processing: unavailable");
+            sender.sendMessage("- failed: unavailable");
+            sender.sendMessage("- deliveredToday: unavailable");
+            sender.sendMessage("- lastPoll: unavailable");
+            sender.sendMessage("- lastError: unavailable");
+        } else {
+            RewardOutboxWorker.RewardOutboxDoctorSnapshot cachedRewardSnapshot = rewardWorker.getCachedDoctorSnapshot();
+            sender.sendMessage("RewardOutbox:");
+            sender.sendMessage("- enabled: " + cachedRewardSnapshot.enabled());
+            sender.sendMessage("- sweetMailInstalled: " + cachedRewardSnapshot.sweetMailInstalled());
+            sender.sendMessage("- sweetMailEnabled: " + cachedRewardSnapshot.sweetMailEnabled());
+            sender.sendMessage("- commandsEnabled: " + cachedRewardSnapshot.commandsEnabled());
+            sender.sendMessage("- pending: " + formatCount(cachedRewardSnapshot.pending()));
+            sender.sendMessage("- processing: " + formatCount(cachedRewardSnapshot.processing()));
+            sender.sendMessage("- failed: " + formatCount(cachedRewardSnapshot.failed()));
+            sender.sendMessage("- deliveredToday: " + formatCount(cachedRewardSnapshot.deliveredToday()));
+            sender.sendMessage("- lastPoll: " + formatDurationAgo(cachedRewardSnapshot.lastPollAt()));
+            sender.sendMessage("- lastError: " + sanitizeError(cachedRewardSnapshot.lastError()));
+
+            rewardWorker.collectDoctorSnapshotAsync().whenComplete((snapshot, throwable) -> Bukkit.getScheduler().runTask(plugin, () -> {
+                if (throwable != null || snapshot == null) {
+                    sender.sendMessage("[StellarStatsSync Doctor][RewardOutbox]");
+                    sender.sendMessage("- pending: unavailable");
+                    sender.sendMessage("- processing: unavailable");
+                    sender.sendMessage("- failed: unavailable");
+                    sender.sendMessage("- deliveredToday: unavailable");
+                    sender.sendMessage("- error: " + sanitizeError(throwable == null ? "unavailable" : throwable.getMessage()));
+                    return;
+                }
+
+                sender.sendMessage("[StellarStatsSync Doctor][RewardOutbox]");
+                sender.sendMessage("- pending: " + formatCount(snapshot.pending()));
+                sender.sendMessage("- processing: " + formatCount(snapshot.processing()));
+                sender.sendMessage("- failed: " + formatCount(snapshot.failed()));
+                sender.sendMessage("- deliveredToday: " + formatCount(snapshot.deliveredToday()));
+                sender.sendMessage("- lastPoll: " + formatDurationAgo(snapshot.lastPollAt()));
+                sender.sendMessage("- lastError: " + sanitizeError(snapshot.lastError()));
+            }));
+        }
 
         if (dbManager == null) {
             sender.sendMessage("[StellarStatsSync Doctor][Database]");

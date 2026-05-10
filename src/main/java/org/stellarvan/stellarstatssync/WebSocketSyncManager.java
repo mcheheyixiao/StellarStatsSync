@@ -11,7 +11,6 @@ import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.scheduler.BukkitTask;
-import org.stellarvan.stellarstatssync.bridge.litesignin.LiteSignInBridge;
 import org.stellarvan.stellarstatssync.websocket.dto.MessageEnvelope;
 
 import java.lang.management.ManagementFactory;
@@ -60,8 +59,6 @@ public class WebSocketSyncManager {
     private static final String TYPE_SNAPSHOT_REQUEST = "snapshot_request";
     private static final String TYPE_SYNC_STATE = "sync_state";
     private static final String TYPE_ERROR = "error";
-    private static final String TYPE_SIGNIN_REQUEST = "signin.request";
-    private static final String TYPE_SIGNIN_RESULT = "signin.result";
     private static final int MAX_PLUGINS_PER_UPDATE = 300;
     private static final long PLUGINS_UPDATE_DEBOUNCE_TICKS = 40L;
     private static final long QUEUE_WARN_INTERVAL_MILLIS = 60_000L;
@@ -137,7 +134,6 @@ public class WebSocketSyncManager {
     private final AtomicBoolean miniMotdReloading = new AtomicBoolean(false);
 
     private volatile WebSocket webSocket;
-    private volatile LiteSignInBridge liteSignInBridge;
     private volatile boolean authDelivered;
     private volatile int lastKnownPlayersVersion = 0;
     private volatile long lastPongAt = 0L;
@@ -393,10 +389,6 @@ public class WebSocketSyncManager {
             return "";
         }
         return maskSensitiveQueryParams(endpoint.toString());
-    }
-
-    public void setLiteSignInBridge(LiteSignInBridge liteSignInBridge) {
-        this.liteSignInBridge = liteSignInBridge;
     }
 
     public void start() {
@@ -2274,50 +2266,6 @@ public class WebSocketSyncManager {
         if (TYPE_ACK.equalsIgnoreCase(messageType)) {
             String requestId = asNonBlankString(envelope.get("requestId"));
             removeFromPending(requestId);
-            return;
-        }
-
-        if (TYPE_SIGNIN_REQUEST.equalsIgnoreCase(messageType)) {
-            LiteSignInBridge bridge = this.liteSignInBridge;
-            String requestId = asNonBlankString(envelope.get("requestId"));
-            if (bridge == null) {
-                Map<String, Object> result = new LinkedHashMap<>();
-                result.put("ok", false);
-                result.put("status", "bridge_disabled");
-                result.put("message", "LiteSignIn bridge is not available.");
-                sendCustomEnvelope(
-                        TYPE_SIGNIN_RESULT,
-                        false,
-                        4100,
-                        "LiteSignIn bridge is not available.",
-                        result,
-                        requestId
-                );
-                return;
-            }
-
-            Object requestPayload = envelope.get("data");
-            if (!(requestPayload instanceof Map<?, ?>)) {
-                requestPayload = envelope.get("payload");
-            }
-            try {
-                bridge.handleSignInRequest(requestId, requestPayload);
-            } catch (Exception ex) {
-                logWarn("Failed to dispatch signin.request: " + sanitizeConfigError(ex.getMessage()));
-                logVerboseThrowable(ex);
-                Map<String, Object> result = new LinkedHashMap<>();
-                result.put("ok", false);
-                result.put("status", "litesignin_api_failed");
-                result.put("message", "Failed to dispatch sign-in request.");
-                sendCustomEnvelope(
-                        TYPE_SIGNIN_RESULT,
-                        false,
-                        4500,
-                        "Failed to dispatch sign-in request.",
-                        result,
-                        requestId
-                );
-            }
             return;
         }
 
