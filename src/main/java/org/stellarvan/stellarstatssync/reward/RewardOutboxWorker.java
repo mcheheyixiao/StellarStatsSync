@@ -636,8 +636,11 @@ public final class RewardOutboxWorker {
         }
 
         private static ProcessResult failure(String error, boolean forceFailed, boolean partialRisk) {
-            String suffix = partialRisk ? " " + PARTIAL_RISK_MESSAGE : "";
-            return new ProcessResult(false, forceFailed, sanitizeError(error + suffix));
+            String message = sanitizeError(error);
+            if (partialRisk && !message.contains(PARTIAL_RISK_MESSAGE)) {
+                message = sanitizeError(message + " " + PARTIAL_RISK_MESSAGE);
+            }
+            return new ProcessResult(false, forceFailed, message);
         }
     }
 }
