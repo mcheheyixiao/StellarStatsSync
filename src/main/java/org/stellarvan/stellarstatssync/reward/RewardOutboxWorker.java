@@ -84,7 +84,8 @@ public final class RewardOutboxWorker {
         plugin.getLogger().info("[RewardOutbox] Worker started. serverId=" + settings.serverId()
                 + ", intervalSeconds=" + settings.pollIntervalSeconds()
                 + ", batchSize=" + settings.batchSize()
-                + ", maxAttempts=" + settings.maxAttempts());
+                + ", maxAttempts=" + settings.maxAttempts()
+                + ", allowNotificationOnlyMail=" + settings.allowNotificationOnlyMail());
     }
 
     public void shutdown() {
@@ -106,6 +107,7 @@ public final class RewardOutboxWorker {
                 schemaReady,
                 schemaError,
                 settings.serverId(),
+                settings.allowNotificationOnlyMail(),
                 sweetMailDispatcher.isPluginInstalled(),
                 settings.sweetMail().enabled() && sweetMailDispatcher.isPluginEnabled(),
                 settings.commands().enabled(),
@@ -131,6 +133,7 @@ public final class RewardOutboxWorker {
                         cached.schemaReady(),
                         cached.schemaError(),
                         cached.serverId(),
+                        cached.allowNotificationOnlyMail(),
                         cached.sweetMailInstalled(),
                         cached.sweetMailEnabled(),
                         cached.commandsEnabled(),
@@ -148,6 +151,7 @@ public final class RewardOutboxWorker {
                     cached.schemaReady(),
                     cached.schemaError(),
                     cached.serverId(),
+                    cached.allowNotificationOnlyMail(),
                     cached.sweetMailInstalled(),
                     cached.sweetMailEnabled(),
                     cached.commandsEnabled(),
@@ -265,8 +269,32 @@ public final class RewardOutboxWorker {
             return ProcessResult.failure("Failed to parse reward_payload_json: " + summarize(ex), false, false);
         }
 
+        int itemsCount = payload.items() == null ? 0 : payload.items().size();
+        int commandsCount = payload.commands() == null ? 0 : payload.commands().size();
+        boolean hasItems = itemsCount > 0;
+        boolean hasCommands = commandsCount > 0;
+        boolean notificationOnly = !hasItems && !hasCommands;
+
+        if (notificationOnly && !settings.allowNotificationOnlyMail()) {
+            return ProcessResult.failure(
+                    "Reward payload has no items and no commands. Refusing to deliver notification-only mail.",
+                    true,
+                    false,
+                    itemsCount,
+                    commandsCount,
+                    true
+            );
+        }
+
         if (payload.isEmpty()) {
-            return ProcessResult.failure("Reward payload is empty. No mail items or commands were provided.", false, false);
+            return ProcessResult.failure(
+                    "Reward payload is empty. No mail items or commands were provided.",
+                    true,
+                    false,
+                    itemsCount,
+                    commandsCount,
+                    notificationOnly
+            );
         }
 
         PlaceholderContext placeholders = PlaceholderContext.from(entry, payload.meta());
@@ -274,7 +302,7 @@ public final class RewardOutboxWorker {
         try {
             resolvedCommands = resolveCommands(payload.commands(), placeholders);
         } catch (RewardDispatchException ex) {
-            return ProcessResult.failure(ex.getMessage(), !ex.retryable(), ex.partialRisk());
+            return ProcessResult.failure(ex.getMessage(), !ex.retryable(), ex.partialRisk(), itemsCount, commandsCount, notificationOnly);
         }
 
         String resolvedTitle = placeholders.replace(resolveMailTitle(payload));
@@ -284,7 +312,14 @@ public final class RewardOutboxWorker {
         try {
             return runOnMainThread(() -> dispatchOnMainThread(payload, placeholders, resolvedTitle, resolvedIcon, resolvedMailContent, resolvedCommands));
         } catch (Exception ex) {
-            return ProcessResult.failure("Failed to dispatch reward on the main thread: " + summarize(ex), false, false);
+            return ProcessResult.failure(
+                    "Failed to dispatch reward on the main thread: " + summarize(ex),
+                    false,
+                    false,
+                    itemsCount,
+                    commandsCount,
+                    notificationOnly
+            );
         }
     }
 
@@ -316,20 +351,26 @@ public final class RewardOutboxWorker {
                 executeCommands(commands);
             }
 
-            return ProcessResult.success();
+            int itemsCount = payload.items() == null ? 0 : payload.items().size();
+            int commandsCount = payload.commands() == null ? 0 : payload.commands().size();
+            return ProcessResult.success(itemsCount, commandsCount, itemsCount == 0 && commandsCount == 0);
         } catch (RewardDispatchException ex) {
             String message = ex.getMessage();
             if (mailDelivered && !ex.partialRisk()) {
                 message = mergeErrors(message, PARTIAL_RISK_MESSAGE);
             }
             boolean forceFailed = mailDelivered || ex.partialRisk();
-            return ProcessResult.failure(message, forceFailed, forceFailed);
+            int itemsCount = payload.items() == null ? 0 : payload.items().size();
+            int commandsCount = payload.commands() == null ? 0 : payload.commands().size();
+            return ProcessResult.failure(message, forceFailed, forceFailed, itemsCount, commandsCount, itemsCount == 0 && commandsCount == 0);
         } catch (Exception ex) {
             String message = summarize(ex);
             if (mailDelivered) {
                 message = mergeErrors(message, PARTIAL_RISK_MESSAGE);
             }
-            return ProcessResult.failure(message, mailDelivered, mailDelivered);
+            int itemsCount = payload.items() == null ? 0 : payload.items().size();
+            int commandsCount = payload.commands() == null ? 0 : payload.commands().size();
+            return ProcessResult.failure(message, mailDelivered, mailDelivered, itemsCount, commandsCount, itemsCount == 0 && commandsCount == 0);
         }
     }
 
@@ -496,6 +537,9 @@ public final class RewardOutboxWorker {
                 + ", rewardType=" + safeValue(entry.rewardType())
                 + ", signDate=" + safeValue(entry.signDate())
                 + ", attempt=" + currentAttempt
+                + ", itemsCount=" + result.itemsCount()
+                + ", commandsCount=" + result.commandsCount()
+                + ", notificationOnly=" + result.notificationOnly()
                 + ", delivered=" + result.delivered()
                 + ", forceFailed=" + result.forceFailed()
                 + ", error=" + sanitizeError(result.error()));
@@ -569,6 +613,7 @@ public final class RewardOutboxWorker {
             boolean schemaReady,
             String schemaError,
             String serverId,
+            boolean allowNotificationOnlyMail,
             boolean sweetMailInstalled,
             boolean sweetMailEnabled,
             boolean commandsEnabled,
@@ -630,17 +675,35 @@ public final class RewardOutboxWorker {
         }
     }
 
-    private record ProcessResult(boolean delivered, boolean forceFailed, String error) {
-        private static ProcessResult success() {
-            return new ProcessResult(true, false, "-");
+    private record ProcessResult(
+            boolean delivered,
+            boolean forceFailed,
+            String error,
+            int itemsCount,
+            int commandsCount,
+            boolean notificationOnly
+    ) {
+        private static ProcessResult success(int itemsCount, int commandsCount, boolean notificationOnly) {
+            return new ProcessResult(true, false, "-", itemsCount, commandsCount, notificationOnly);
         }
 
         private static ProcessResult failure(String error, boolean forceFailed, boolean partialRisk) {
+            return failure(error, forceFailed, partialRisk, -1, -1, false);
+        }
+
+        private static ProcessResult failure(
+                String error,
+                boolean forceFailed,
+                boolean partialRisk,
+                int itemsCount,
+                int commandsCount,
+                boolean notificationOnly
+        ) {
             String message = sanitizeError(error);
             if (partialRisk && !message.contains(PARTIAL_RISK_MESSAGE)) {
                 message = sanitizeError(message + " " + PARTIAL_RISK_MESSAGE);
             }
-            return new ProcessResult(false, forceFailed, message);
+            return new ProcessResult(false, forceFailed, message, itemsCount, commandsCount, notificationOnly);
         }
     }
 }

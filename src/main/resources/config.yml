@@ -79,6 +79,7 @@ reward-outbox:
   max-attempts: 5
   processing-timeout-seconds: 120
   server-id: "stellar-main"
+  allow-notification-only-mail: false
 
   sweetmail:
     enabled: true

@@ -253,6 +253,7 @@ public class StatsyncCommand implements CommandExecutor {
             sender.sendMessage("- schemaReady: false");
             sender.sendMessage("- schemaError: unavailable");
             sender.sendMessage("- serverId: unavailable");
+            sender.sendMessage("- allowNotificationOnlyMail: false");
             sender.sendMessage("- sweetMailInstalled: false");
             sender.sendMessage("- sweetMailEnabled: false");
             sender.sendMessage("- commandsEnabled: false");
@@ -269,6 +270,7 @@ public class StatsyncCommand implements CommandExecutor {
             sender.sendMessage("- schemaReady: " + cachedRewardSnapshot.schemaReady());
             sender.sendMessage("- schemaError: " + sanitizeError(cachedRewardSnapshot.schemaError()));
             sender.sendMessage("- serverId: " + safeValue(cachedRewardSnapshot.serverId()));
+            sender.sendMessage("- allowNotificationOnlyMail: " + cachedRewardSnapshot.allowNotificationOnlyMail());
             sender.sendMessage("- sweetMailInstalled: " + cachedRewardSnapshot.sweetMailInstalled());
             sender.sendMessage("- sweetMailEnabled: " + cachedRewardSnapshot.sweetMailEnabled());
             sender.sendMessage("- commandsEnabled: " + cachedRewardSnapshot.commandsEnabled());
@@ -294,6 +296,7 @@ public class StatsyncCommand implements CommandExecutor {
                 sender.sendMessage("- schemaReady: " + snapshot.schemaReady());
                 sender.sendMessage("- schemaError: " + sanitizeError(snapshot.schemaError()));
                 sender.sendMessage("- serverId: " + safeValue(snapshot.serverId()));
+                sender.sendMessage("- allowNotificationOnlyMail: " + snapshot.allowNotificationOnlyMail());
                 sender.sendMessage("- pending: " + formatCount(snapshot.pending()));
                 sender.sendMessage("- processing: " + formatCount(snapshot.processing()));
                 sender.sendMessage("- failed: " + formatCount(snapshot.failed()));

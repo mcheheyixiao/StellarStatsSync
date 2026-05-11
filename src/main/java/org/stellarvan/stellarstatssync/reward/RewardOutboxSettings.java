@@ -12,6 +12,7 @@ public record RewardOutboxSettings(
         String serverId,
         SweetMailSettings sweetMail,
         CommandSettings commands,
+        boolean allowNotificationOnlyMail,
         boolean debug
 ) {
     public static RewardOutboxSettings fromConfig(FileConfiguration config) {
@@ -37,6 +38,7 @@ public record RewardOutboxSettings(
                 commands == null || commands.getBoolean("run-on-main-thread", true)
         );
 
+        boolean allowNotificationOnlyMail = root != null && root.getBoolean("allow-notification-only-mail", false);
         boolean debug = root != null && root.getBoolean("debug", false);
         return new RewardOutboxSettings(
                 enabled,
@@ -47,6 +49,7 @@ public record RewardOutboxSettings(
                 serverId,
                 sweetMailSettings,
                 commandSettings,
+                allowNotificationOnlyMail,
                 debug
         );
     }

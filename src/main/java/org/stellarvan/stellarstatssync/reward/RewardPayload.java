@@ -51,7 +51,7 @@ public final class RewardPayload {
         } else {
             List<String> normalized = new ArrayList<>(commands.size());
             for (String command : commands) {
-                if (command != null) {
+                if (command != null && !command.isBlank()) {
                     normalized.add(command);
                 }
             }
