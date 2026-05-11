@@ -44,9 +44,9 @@ status:
   enabled: true
   interval-seconds: 5
 
-  # Privacy: if true, website/WebSocket center can receive current online player names.
+  # Privacy: if true, website/WebSocket center can receive the current online player list.
   expose-player-list: true
-  # Privacy: if true, each public player entry includes UUID.
+  # Privacy: if true, each public player entry includes UUID; player names remain available when the list is exposed.
   include-player-uuid: true
 
   include-motd: true

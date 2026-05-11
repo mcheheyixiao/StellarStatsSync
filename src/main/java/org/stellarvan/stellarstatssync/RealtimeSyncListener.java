@@ -38,7 +38,15 @@ public class RealtimeSyncListener implements Listener {
         }
 
         Player player = event.getPlayer();
-        webSocketSyncManager.sendPlayerQuit(player.getUniqueId().toString(), player.getName());
+        String playerUuid = player.getUniqueId().toString();
+        String playerName = player.getName();
+        // Let Bukkit finish removing the player before rebuilding the online snapshot.
+        Bukkit.getScheduler().runTask(plugin, () -> {
+            if (plugin.isShuttingDown()) {
+                return;
+            }
+            webSocketSyncManager.sendPlayerQuit(playerUuid, playerName);
+        });
     }
 
     @EventHandler(ignoreCancelled = true)

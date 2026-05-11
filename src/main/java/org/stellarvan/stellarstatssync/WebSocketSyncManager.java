@@ -412,6 +412,9 @@ public class WebSocketSyncManager {
                     reportIntervalTicks,
                     reportIntervalTicks
             );
+            if (!enabled) {
+                sendStatsSnapshot();
+            }
         }
         if (enabled && syncPluginStatus) {
             this.pluginsReportTask = Bukkit.getScheduler().runTaskTimer(
@@ -475,10 +478,10 @@ public class WebSocketSyncManager {
 
     public void sendPlayerJoin(@SuppressWarnings("unused") String playerUuid, String playerName) {
         // playerUuid reserved for future protocol fields.
-        if (!enabled || playerName == null) {
+        if (!started.get() || playerName == null) {
             return;
         }
-        if (syncPlayerJoinQuit) {
+        if (enabled && syncPlayerJoinQuit) {
             sendPlayersDelta();
         }
         scheduleStatusSnapshotRefresh();
@@ -486,10 +489,10 @@ public class WebSocketSyncManager {
 
     public void sendPlayerQuit(@SuppressWarnings("unused") String playerUuid, String playerName) {
         // playerUuid reserved for future protocol fields.
-        if (!enabled || playerName == null) {
+        if (!started.get() || playerName == null) {
             return;
         }
-        if (syncPlayerJoinQuit) {
+        if (enabled && syncPlayerJoinQuit) {
             sendPlayersDelta();
         }
         scheduleStatusSnapshotRefresh();
@@ -1301,7 +1304,8 @@ public class WebSocketSyncManager {
             } catch (Exception ignored) {
             }
         } else {
-            legacyText = Bukkit.getMotd();
+            Component motd = Bukkit.motd();
+            legacyText = LegacyComponentSerializer.legacySection().serialize(motd);
             plainText = stripMiniMessageToPlain(legacyText);
         }
 
